@@ -136,10 +136,6 @@ Issues, bug reports, and pull requests are welcome. When submitting a change:
 3. Run `bash -n remotecheck` and `shellcheck remotecheck` when available.
 4. Include reproduction steps for bugs and examples for behavior changes.
 
-## Creator
-
-Created by **Pavlos**.
-
 ## License
 
 No license has been selected yet. Before publishing the repository as open source, add a license file (for example, MIT, Apache-2.0, or GPL-3.0) that matches how you want others to use, modify, and redistribute the project.
