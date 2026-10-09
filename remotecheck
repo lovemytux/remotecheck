@@ -1,0 +1,514 @@
+#!/usr/bin/env bash
+
+# remotecheck
+# Open-source Bash tool for remote Linux inventory and basic security checks.
+# Creator: lovemytux
+# Created: 2026-10-09
+# License: Free to use - Apache License 2.0
+#
+# Uses SSH and standard remote Linux utilities to collect host, OS, network,
+# service, process, and basic security information. Supports optional sudo and
+# JSON output. Intended for authorized systems only.
+
+set -o pipefail
+
+VERSION='1.2.0'
+JSON=0
+PORT=22
+IDENTITY=''
+CONNECT_TIMEOUT=10
+
+usage() {
+  cat <<'EOF'
+remotecheck - Remote Linux inventory and basic security assessment
+
+Usage:
+  remotecheck [--json] [-p PORT] [-i IDENTITY_FILE] user@server
+
+Options:
+  --json             Output JSON containing the report text
+  -p PORT            SSH port (default: 22)
+  -i FILE            SSH identity/private-key file
+  -h, --help         Show this help
+  -V, --version      Show version
+
+Sudo behavior:
+  Tries passwordless sudo first. If unavailable, prompts for a password;
+  press Enter to continue without sudo.
+EOF
+}
+
+die() {
+  printf 'remotecheck: %s\n' "$*" >&2
+  exit 1
+}
+
+while (($#)); do
+  case "$1" in
+  --json)
+    JSON=1
+    shift
+    ;;
+  -p)
+    (($# >= 2)) || die 'Missing port after -p'
+    [[ $2 =~ ^[0-9]+$ ]] || die 'Port must be numeric'
+    PORT=$2
+    shift 2
+    ;;
+  -i)
+    (($# >= 2)) || die 'Missing identity file after -i'
+    IDENTITY=$2
+    shift 2
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  -V | --version)
+    printf 'remotecheck %s\n' "$VERSION"
+    exit 0
+    ;;
+  --)
+    shift
+    break
+    ;;
+  -*) die "Unknown option: $1" ;;
+  *) break ;;
+  esac
+done
+
+(($# == 1)) || {
+  usage >&2
+  exit 2
+}
+TARGET=$1
+[[ $TARGET != -* ]] || die 'Invalid SSH target'
+command -v ssh >/dev/null 2>&1 || die 'ssh is required'
+command -v base64 >/dev/null 2>&1 || die 'base64 is required'
+
+SSH_OPTS=(-o ConnectTimeout="$CONNECT_TIMEOUT" -p "$PORT")
+if [[ -n $IDENTITY ]]; then SSH_OPTS+=(-i "$IDENTITY"); fi
+
+# Confirm SSH access before asking for a sudo password.
+ssh "${SSH_OPTS[@]}" "$TARGET" true || die "Cannot connect to $TARGET over SSH"
+
+SUDO_AVAILABLE=0
+SUDO_STATUS='Unavailable or skipped; running without sudo'
+
+# First try passwordless sudo on the remote machine.
+if ssh "${SSH_OPTS[@]}" "$TARGET" 'sudo -n -v' >/dev/null 2>&1; then
+  SUDO_AVAILABLE=1
+  SUDO_STATUS='Passwordless sudo available'
+else
+  sudo_password=''
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf 'Sudo password (press Enter to skip): ' >/dev/tty
+    IFS= read -r -s sudo_password </dev/tty || sudo_password=''
+    printf '\r\033[2K\n' >/dev/tty
+  fi
+
+  if [[ -n $sudo_password ]]; then
+    # Password is sent over SSH stdin, not placed in argv or environment.
+    if printf '%s\n' "$sudo_password" | ssh "${SSH_OPTS[@]}" "$TARGET" 'sudo -S -p "" -v' >/dev/null 2>&1; then
+      SUDO_AVAILABLE=1
+      SUDO_STATUS='Sudo authenticated with supplied password'
+    else
+      SUDO_STATUS='Password rejected; continuing without sudo'
+    fi
+  fi
+  unset sudo_password
+fi
+
+# Decide color locally: SSH does not allocate a remote TTY by default, but
+# ANSI colors still work when this script's output is going to a local terminal.
+COLOR_OUTPUT=0
+if [[ $JSON != 1 && -t 1 && -z ${NO_COLOR:-} ]]; then
+  COLOR_OUTPUT=1
+fi
+
+# Remote collector: delivered on SSH stdin. No generated/nested bash -c command.
+# Values in the SSH command string are intentionally expanded locally and passed as remote environment assignments.
+# shellcheck disable=SC2029
+ssh "${SSH_OPTS[@]}" "$TARGET" "REMOTE_SUDO=$SUDO_AVAILABLE REMOTE_SUDO_STATUS='$SUDO_STATUS' REMOTE_JSON=$JSON REMOTE_TTY=$COLOR_OUTPUT bash -s" <<'REMOTE_COLLECTOR'
+set -o pipefail
+USE_SUDO=${REMOTE_SUDO:-0}
+SUDO_STATUS=${REMOTE_SUDO_STATUS:-'Unavailable or skipped; running without sudo'}
+JSON=${REMOTE_JSON:-0}
+
+clean() {
+    local v=${1:-}
+    v=${v//$'\n'/ }
+    v=${v//$'\r'/ }
+    v=${v//|//}
+    printf '%s' "$v"
+}
+
+TABLE_KEY_WIDTH=28
+TABLE_VALUE_WIDTH=54
+USE_COLOR=0
+if [[ $JSON != 1 && ${REMOTE_TTY:-0} == 1 ]]; then
+    USE_COLOR=1
+fi
+
+blue() {
+    if ((USE_COLOR)); then
+        printf '\033[1;34m%s\033[0m' "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+cyan() {
+    if ((USE_COLOR)); then
+        printf '\033[1;36m%s\033[0m' "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+table_border() {
+    printf '+-%*s-+-%*s-+\n' "$TABLE_KEY_WIDTH" '' "$TABLE_VALUE_WIDTH" '' |
+        tr ' ' '-'
+}
+
+table_header() {
+    local heading=$1
+    if [[ $heading == *PROPERTY* && $heading == *VALUE* ]]; then
+        table_border
+        printf '| '
+        cyan "$(printf '%-*s' "$TABLE_KEY_WIDTH" 'PROPERTY')"
+        printf ' | '
+        cyan "$(printf '%-*s' "$TABLE_VALUE_WIDTH" 'VALUE')"
+        printf ' |\n'
+        table_border
+    else
+        blue "$heading"
+        printf '\n'
+        printf '%s\n' '----------------------------------------------------------------------------------------------------'
+    fi
+}
+
+section() {
+    printf '\n'
+    blue "$1"
+    printf '\n'
+    printf '%s\n' '------------------------------'
+}
+
+row() {
+    local key value
+    key=$(clean "$1")
+    value=$(clean "$2")
+    printf '| %-*.*s | %-*.*s |\n' \
+        "$TABLE_KEY_WIDTH" "$TABLE_KEY_WIDTH" "$key" \
+        "$TABLE_VALUE_WIDTH" "$TABLE_VALUE_WIDTH" "$value"
+}
+
+# Fixed-width boxed table helpers for multi-column sections.
+multi_border() {
+    local widths=("$@") i
+    printf '+'
+    for i in "${widths[@]}"; do
+        printf '%*s+' "$((i + 2))" '' | tr ' ' '-'
+    done
+    printf '\n'
+}
+
+multi_header() {
+    local widths=("$1") # unused placeholder for Bash 4 compatibility
+    shift
+    local labels=("$@") i width
+    local widths_list=()
+    # Widths are passed as alternating width,label pairs.
+    for ((i=0; i<${#labels[@]}; i+=2)); do widths_list+=("${labels[i]}"); done
+    multi_border "${widths_list[@]}"
+    printf '|'
+    for ((i=0; i<${#labels[@]}; i+=2)); do
+        width=${labels[i]}
+        printf ' '
+        cyan "$(printf '%-*.*s' "$width" "$width" "${labels[i+1]}")"
+        printf ' |'
+    done
+    printf '\n'
+    multi_border "${widths_list[@]}"
+}
+
+multi_row() {
+    local widths_csv=$1
+    shift
+    local widths=() values=("$@") i width value
+    IFS=, read -r -a widths <<< "$widths_csv"
+    printf '|'
+    for ((i=0; i<${#widths[@]}; i++)); do
+        width=${widths[i]}
+        value=$(clean "${values[i]:-}")
+        printf ' %-*.*s |' "$width" "$width" "$value"
+    done
+    printf '\n'
+}
+have() { command -v "$1" >/dev/null 2>&1; }
+run_priv() {
+    if [[ $USE_SUDO == 1 ]]; then sudo -n -- "$@" 2>/dev/null; else "$@" 2>/dev/null; fi
+}
+
+report_file=$(mktemp) || exit 1
+trap 'rm -f "$report_file"' EXIT
+# REMOTE_TTY is passed from the local terminal by the SSH command.
+
+{
+    printf '%s\n' 'remotecheck report'
+    printf '\n'
+    table_header 'PROPERTY                       | VALUE'
+    row 'Host' "$(hostname 2>/dev/null || printf unknown)"
+    row 'FQDN' "$(hostname -f 2>/dev/null || printf unavailable)"
+    row 'Current user' "$(id -un 2>/dev/null || printf unknown)"
+    row 'User ID / groups' "$(id 2>/dev/null || printf unavailable)"
+    row 'Collected at' "$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date)"
+    row 'Sudo status' "$SUDO_STATUS"
+    table_border
+
+    section 'Operating system'
+    table_header 'PROPERTY                       | VALUE'
+    if [[ -r /etc/os-release ]]; then
+        . /etc/os-release
+        row 'Distribution' "${PRETTY_NAME:-${NAME:-unknown}}"
+        row 'Version ID' "${VERSION_ID:-unknown}"
+    else
+        row 'Distribution' 'Cannot read /etc/os-release'
+    fi
+    row 'Kernel' "$(uname -srmo 2>/dev/null || uname -a)"
+    row 'Architecture' "$(uname -m 2>/dev/null || printf unknown)"
+    row 'Uptime' "$(uptime -p 2>/dev/null || uptime 2>/dev/null || printf unavailable)"
+    table_border
+
+    section 'Network interfaces'
+    multi_header ignored 14 INTERFACE 8 STATE 48 ADDRESSES
+    if have ip; then
+        interface_data=$(ip -brief address 2>/dev/null || true)
+        if [[ -n $interface_data ]]; then
+            while read -r iface state addresses; do
+                multi_row '14,8,48' "$iface" "$state" "$addresses"
+            done <<< "$interface_data"
+        else
+            multi_row '14,8,48' 'Network' 'unknown' 'Query failed or no interfaces returned'
+        fi
+    else
+        multi_row '14,8,48' 'Network' 'missing' 'ip command unavailable'
+    fi
+    multi_border 14 8 48
+
+    section 'Listening TCP/UDP sockets'
+    multi_header ignored 8 PROTOCOL 10 STATE 30 LOCAL_ADDRESS 30 PEER_ADDRESS 24 PROCESS
+    if have ss; then
+        socket_data=$(ss -H -lntup 2>/dev/null || ss -H -lntu 2>/dev/null || true)
+        if [[ -n $socket_data ]]; then
+            while IFS= read -r socket_line; do
+                read -r proto state recvq sendq local_addr peer_addr process_info <<< "$socket_line"
+                multi_row '8,10,30,30,24' "$proto" "$state" "$local_addr" "$peer_addr" "${process_info:--}"
+            done <<< "$socket_data"
+        else
+            multi_row '8,10,30,30,24' 'sockets' 'none' 'No listeners found' '-'
+        fi
+    else
+        multi_row '8,10,30,30,24' 'ss' 'missing' 'ss command unavailable' '-'
+    fi
+    multi_border 8 10 30 30 24
+
+    section 'Running systemd services'
+    multi_header ignored 28 UNIT 10 STATE 52 DESCRIPTION
+    if have systemctl; then
+        running_units=$(systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null || true)
+        if [[ -n $running_units ]]; then
+            while read -r unit load active sub description; do
+                multi_row '28,10,52' "$unit" "$active" "$description"
+            done <<< "$running_units"
+        else
+            multi_row '28,10,52' 'Services' 'unknown' 'No running services reported'
+        fi
+    else
+        multi_row '28,10,52' 'systemctl' 'missing' 'systemctl command unavailable'
+    fi
+    multi_border 28 10 52
+
+    section 'Failed systemd units'
+    multi_header ignored 28 UNIT 10 LOAD 11 ACTIVE 11 SUB 40 DESCRIPTION
+    if have systemctl; then
+        failed_units=$(systemctl --failed --no-legend --no-pager 2>/dev/null || true)
+        if [[ -n $failed_units ]]; then
+            while read -r unit load active sub description; do
+                multi_row '28,10,11,11,40' "$unit" "$load" "$active" "$sub" "$description"
+            done <<< "$failed_units"
+        else
+            multi_row '28,10,11,11,40' 'systemd' '-' '-' '-' 'No failed units reported'
+        fi
+    else
+        multi_row '28,10,11,11,40' 'systemctl' '-' '-' '-' 'systemctl unavailable'
+    fi
+    multi_border 28 10 11 11 40
+
+    section 'Process sample'
+    multi_header ignored 24 USER 10 PID 54 COMMAND
+    if have ps; then
+        ps -eo user:24,pid,args --sort=-%cpu 2>/dev/null | tail -n +2 | head -n 15 |
+            while read -r proc_user proc_pid proc_command; do
+                multi_row '24,10,54' "$proc_user" "$proc_pid" "$proc_command"
+            done
+    else
+        multi_row '24,10,54' 'processes' '-' 'ps command unavailable'
+    fi
+    multi_border 24 10 54
+
+    section 'Basic security checks'
+    multi_header ignored 28 CHECK 54 RESULT
+    sshd_bin=''
+    for candidate in /usr/sbin/sshd /usr/bin/sshd; do
+        if [[ -x $candidate ]]; then sshd_bin=$candidate; break; fi
+    done
+
+    if [[ -n $sshd_bin ]]; then
+        sshd_config=$(run_priv "$sshd_bin" -T || true)
+        if [[ -n $sshd_config ]]; then
+            permit_root=$(awk '$1 == "permitrootlogin" {print $2; exit}' <<< "$sshd_config")
+            password_auth=$(awk '$1 == "passwordauthentication" {print $2; exit}' <<< "$sshd_config")
+
+            # Use if/elif rather than case patterns to keep this block simple.
+            if [[ $permit_root == no ]]; then
+                row 'SSH root login' 'PASS - PermitRootLogin no'
+            elif [[ $permit_root == prohibit-password || $permit_root == without-password ]]; then
+                row 'SSH root login' 'REVIEW - key-based root login may be allowed'
+            elif [[ $permit_root == yes ]]; then
+                row 'SSH root login' 'WARNING - PermitRootLogin yes'
+            else
+                row 'SSH root login' 'INCONCLUSIVE - value unavailable'
+            fi
+
+            if [[ $password_auth == no ]]; then
+                row 'SSH password authentication' 'INFO - disabled'
+            elif [[ $password_auth == yes ]]; then
+                row 'SSH password authentication' 'REVIEW - enabled'
+            else
+                row 'SSH password authentication' 'INCONCLUSIVE - value unavailable'
+            fi
+        else
+            row 'SSH configuration' 'INCONCLUSIVE - could not read effective configuration'
+        fi
+    else
+        row 'SSH configuration' 'INCONCLUSIVE - sshd binary not found'
+    fi
+
+    multi_border 28 54
+
+    section 'Package updates'
+    multi_header ignored 28 CHECK 54 RESULT
+    if have apt-get; then
+        if [[ $USE_SUDO == 1 ]]; then
+            updates=$(run_priv apt-get -s upgrade | awk '/^Inst / {n++} END {print n+0}')
+            row 'Pending apt updates' "${updates:-unknown} package(s) indicated by simulation"
+        else
+            row 'Pending apt updates' 'SKIPPED - sudo unavailable'
+        fi
+    elif have dnf; then
+        if [[ $USE_SUDO == 1 ]]; then row 'Pending dnf updates' 'Detected dnf; verify with dnf check-update'; else row 'Pending dnf updates' 'SKIPPED - sudo unavailable'; fi
+    elif have yum; then
+        row 'Pending yum updates' 'Verify manually with yum check-update'
+    else
+        row 'Package updates' 'No supported package manager detected'
+    fi
+
+    multi_border 28 54
+
+    section 'World-writable temporary files'
+    multi_header ignored 28 CHECK 54 RESULT
+    if have find; then
+        if [[ $USE_SUDO == 1 ]]; then
+            writable_count=$(run_priv find /tmp /var/tmp -xdev -type f -perm -0002 -print | wc -l | tr -d ' ')
+            row 'World-writable files' "${writable_count:-0} found"
+        else
+            writable_count=$(find /tmp /var/tmp -xdev -type f -perm -0002 -print 2>/dev/null | wc -l | tr -d ' ')
+            row 'Accessible files' "${writable_count:-0} found; results may be incomplete"
+        fi
+    else
+        row 'File check' 'find command unavailable'
+    fi
+
+    multi_border 28 54
+
+    section 'Scan summary'
+    table_header 'PROPERTY                       | VALUE'
+    if [[ $USE_SUDO == 1 ]]; then
+        row 'Scan status' 'Completed'
+        row 'Sudo status' "$SUDO_STATUS"
+        row 'Coverage' 'Privileged checks attempted where implemented'
+    else
+        row 'Scan status' 'Completed with limited privileges'
+        row 'Sudo status' 'Unavailable'
+        row 'Coverage' 'Checks requiring elevated privileges may be incomplete'
+    fi
+    multi_border 28 54
+    printf '\n'
+    if [[ $USE_SUDO == 1 ]]; then
+        printf '%s\n' 'Scan completed with sudo available.'
+    else
+        printf '%s\n' 'NOTICE: Sudo was unavailable or skipped.'
+        printf '%s\n' 'Accessible checks were completed; some results may be incomplete.'
+    fi
+    printf '%s\n' 'This basic scan is not a guarantee that the host is secure.'
+} >"$report_file"
+
+if [[ $JSON == 1 ]]; then
+    # JSON mode emits readable section blocks without ASCII table borders.
+    # Keep each report line as a JSON string, stripping table rules and
+    # converting pipe-delimited rows into simple readable field lines.
+    awk '
+        function trim(s) {
+            sub(/^[[:space:]]+/, "", s)
+            sub(/[[:space:]]+$/, "", s)
+            return s
+        }
+        function escape_json(s) {
+            gsub(/\\/, "\\\\", s)
+            gsub(/"/, "\\\"", s)
+            gsub(/\t/, "\\t", s)
+            gsub(/\r/, "\\r", s)
+            return s
+        }
+        {
+            line = $0
+
+            # Drop ASCII table borders and the repetitive table column headers.
+            if (line ~ /^[+| -]+$/ && line ~ /[-+]/) next
+            if (line ~ /^\|[[:space:]]*PROPERTY[[:space:]]*\|/) next
+            if (line ~ /^\|[[:space:]]*INTERFACE[[:space:]]*\|/) next
+            if (line ~ /^\|[[:space:]]*PROTOCOL[[:space:]]*\|/) next
+            if (line ~ /^\|[[:space:]]*UNIT[[:space:]]*\|/) next
+            if (line ~ /^\|[[:space:]]*USER[[:space:]]*\|/) next
+            if (line ~ /^\|[[:space:]]*CHECK[[:space:]]*\|/) next
+
+            # Convert boxed rows to readable non-table text.
+            if (line ~ /^\|/) {
+                sub(/^\|[[:space:]]*/, "", line)
+                sub(/[[:space:]]*\|[[:space:]]*$/, "", line)
+                gsub(/[[:space:]]*\|[[:space:]]*/, " — ", line)
+                line = trim(line)
+            }
+
+            line = escape_json(line)
+            if (count++) printf ",\n"
+            printf "    \"%s\"", line
+        }
+        END {
+            printf "\n"
+        }
+    ' "$report_file" > "${report_file}.json-lines"
+
+    {
+        printf '{\n  "sudo_available": %s,\n  "report": [\n' \
+            "$([[ ${REMOTE_SUDO:-0} == 1 ]] && printf true || printf false)"
+        cat "${report_file}.json-lines"
+        printf '  ]\n}\n'
+    }
+    rm -f "${report_file}.json-lines"
+else
+    cat "$report_file"
+fi
+REMOTE_COLLECTOR
