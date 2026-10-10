@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Bash syntax
+        run: bash -n remotecheck
+
+      - name: ShellCheck (script)
+        run: shellcheck remotecheck
+
+      - name: ShellCheck (remote collector)
+        run: |
+          awk '/^  cat <<.REMOTE_COLLECTOR.$/{f=1;next} /^REMOTE_COLLECTOR$/{f=0} f' remotecheck |
+            shellcheck -s bash -e SC2034 -
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y bats jq openssh-server
+
+      - name: Start an SSH server on localhost
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          chmod go-w ~
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/rc_test
+          cat ~/.ssh/rc_test.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          sudo systemctl start ssh || sudo service ssh start
+          for i in 1 2 3 4 5; do ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2>/dev/null && break; sleep 1; done
+
+      - name: Run tests
+        run: |
+          RC_TEST_TARGET="$(whoami)@localhost" \
+          RC_TEST_ARGS="-i $HOME/.ssh/rc_test" \
+            bats --print-output-on-failure test/

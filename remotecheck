@@ -4,37 +4,86 @@
 # Open-source Bash tool for remote Linux inventory and basic security checks.
 # Creator: lovemytux
 # Created: 2026-10-09
-# License: Free to use - Apache License 2.0
+# License: Apache-2.0
 #
 # Uses SSH and standard remote Linux utilities to collect host, OS, network,
-# service, process, and basic security information. Supports optional sudo and
-# JSON output. Intended for authorized systems only.
+# service, process, resource, and basic security information from one or more
+# hosts. Supports optional sudo and JSON output. Intended for authorized
+# systems only.
+#
+# Design: a collector script runs on each remote host and prints tab-separated
+# records. This script renders those records locally, either as boxed tables
+# or as structured JSON, so both outputs come from the same data.
 
 set -o pipefail
 
-VERSION='1.2.0'
+VERSION='1.4.0'
 JSON=0
-PORT=22
+PORT=''
 IDENTITY=''
+JUMP=''
+NO_SUDO=0
+ASK_SUDO_PASS=0
 CONNECT_TIMEOUT=10
+FAIL_ON=''
+JOBS=5
+OUT_DIR=''
+HOSTS_FILES=()
+USER_SSH_OPTS=()
+TARGETS=()
+MULTI=0
+COLOR_OUTPUT=0
+CTL_DIR=''
+SHARED_SUDO_PW=''
+PROMPTED_PW=''
 
 usage() {
   cat <<'EOF'
 remotecheck - Remote Linux inventory and basic security assessment
 
 Usage:
-  remotecheck [--json] [-p PORT] [-i IDENTITY_FILE] user@server
+  remotecheck [options] user@server [user@server ...]
+  remotecheck [options] -f HOSTS_FILE
 
-Options:
-  --json             Output JSON containing the report text
-  -p PORT            SSH port (default: 22)
+Output:
+  --json             Output structured JSON
+  --out DIR          Also write one report file per host into DIR
+  --fail-on LEVEL    Exit 3 if any finding is at LEVEL or worse
+                     (LEVEL: review or warning)
+
+SSH:
+  -p PORT            SSH port, 1-65535 (default: from ssh config, else 22)
   -i FILE            SSH identity/private-key file
+  -J JUMP            Jump host(s), passed to ssh -J
+  -o OPTION          Extra ssh option as Key=Value (repeatable)
+
+Sudo:
+  --no-sudo          Do not try sudo and never prompt for a password
+  --ask-sudo-pass    Prompt once for a sudo password before scanning and use
+                     it where passwordless sudo is unavailable
+
+Multiple hosts:
+  -f FILE            Read targets from FILE (one per line, # starts a comment)
+  -j N               Hosts scanned in parallel, 1-64 (default: 5)
+
+Other:
   -h, --help         Show this help
   -V, --version      Show version
 
 Sudo behavior:
-  Tries passwordless sudo first. If unavailable, prompts for a password;
-  press Enter to continue without sudo.
+  Single host: tries passwordless sudo first; if unavailable, prompts for a
+  password (press Enter to skip). Multiple hosts: never prompts per host; use
+  --ask-sudo-pass to supply one password up front. Multi-host scans use SSH
+  BatchMode, so key or agent authentication is required.
+
+Environment:
+  NO_COLOR           Disable colored output when set
+
+Exit status:
+  0 report(s) produced
+  1 runtime error (SSH or collector failure on any host)
+  2 usage error
+  3 findings at or above the --fail-on level
 EOF
 }
 
@@ -43,472 +92,1234 @@ die() {
   exit 1
 }
 
-while (($#)); do
-  case "$1" in
-  --json)
-    JSON=1
-    shift
-    ;;
-  -p)
-    (($# >= 2)) || die 'Missing port after -p'
-    [[ $2 =~ ^[0-9]+$ ]] || die 'Port must be numeric'
-    PORT=$2
-    shift 2
-    ;;
-  -i)
-    (($# >= 2)) || die 'Missing identity file after -i'
-    IDENTITY=$2
-    shift 2
-    ;;
-  -h | --help)
-    usage
-    exit 0
-    ;;
-  -V | --version)
-    printf 'remotecheck %s\n' "$VERSION"
-    exit 0
-    ;;
-  --)
-    shift
-    break
-    ;;
-  -*) die "Unknown option: $1" ;;
-  *) break ;;
-  esac
-done
-
-(($# == 1)) || {
-  usage >&2
+usage_error() {
+  printf 'remotecheck: %s\n' "$*" >&2
+  printf "Try 'remotecheck --help' for more information.\n" >&2
   exit 2
 }
-TARGET=$1
-[[ $TARGET != -* ]] || die 'Invalid SSH target'
-command -v ssh >/dev/null 2>&1 || die 'ssh is required'
-command -v base64 >/dev/null 2>&1 || die 'base64 is required'
 
-SSH_OPTS=(-o ConnectTimeout="$CONNECT_TIMEOUT" -p "$PORT")
-if [[ -n $IDENTITY ]]; then SSH_OPTS+=(-i "$IDENTITY"); fi
+progress() {
+  if [[ -t 2 ]]; then printf 'remotecheck: %s\n' "$*" >&2; fi
+}
 
-# Confirm SSH access before asking for a sudo password.
-ssh "${SSH_OPTS[@]}" "$TARGET" true || die "Cannot connect to $TARGET over SSH"
+need_arg() {
+  (($# >= 2)) || usage_error "Missing value after $1"
+}
 
-SUDO_AVAILABLE=0
-SUDO_STATUS='Unavailable or skipped; running without sudo'
+to_lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
 
-# First try passwordless sudo on the remote machine.
-if ssh "${SSH_OPTS[@]}" "$TARGET" 'sudo -n -v' >/dev/null 2>&1; then
-  SUDO_AVAILABLE=1
-  SUDO_STATUS='Passwordless sudo available'
-else
-  sudo_password=''
-  if [[ -r /dev/tty && -w /dev/tty ]]; then
-    printf 'Sudo password (press Enter to skip): ' >/dev/tty
-    IFS= read -r -s sudo_password </dev/tty || sudo_password=''
-    printf '\r\033[2K\n' >/dev/tty
-  fi
+validate_ssh_option() {
+  local opt=$1 key
+  [[ $opt =~ ^[A-Za-z][A-Za-z0-9]*=.+$ ]] || usage_error "SSH option must look like Key=Value: $opt"
+  key=$(to_lower "${opt%%=*}")
+  case $key in
+  controlmaster | controlpath | controlpersist)
+    usage_error "-o ${opt%%=*} is managed by remotecheck and cannot be set"
+    ;;
+  esac
+}
 
-  if [[ -n $sudo_password ]]; then
-    # Password is sent over SSH stdin, not placed in argv or environment.
-    if printf '%s\n' "$sudo_password" | ssh "${SSH_OPTS[@]}" "$TARGET" 'sudo -S -p "" -v' >/dev/null 2>&1; then
-      SUDO_AVAILABLE=1
-      SUDO_STATUS='Sudo authenticated with supplied password'
-    else
-      SUDO_STATUS='Password rejected; continuing without sudo'
+parse_args() {
+  while (($#)); do
+    case "$1" in
+    --json)
+      JSON=1
+      shift
+      ;;
+    --no-sudo)
+      NO_SUDO=1
+      shift
+      ;;
+    --ask-sudo-pass)
+      ASK_SUDO_PASS=1
+      shift
+      ;;
+    --out)
+      need_arg "$@"
+      OUT_DIR=$2
+      shift 2
+      ;;
+    --fail-on)
+      need_arg "$@"
+      case $2 in
+      review | warning) FAIL_ON=$2 ;;
+      *) usage_error "--fail-on must be 'review' or 'warning'" ;;
+      esac
+      shift 2
+      ;;
+    -p)
+      need_arg "$@"
+      if [[ ! $2 =~ ^[0-9]{1,5}$ ]] || ((10#$2 < 1 || 10#$2 > 65535)); then
+        usage_error 'Port must be a number between 1 and 65535'
+      fi
+      PORT=$((10#$2))
+      shift 2
+      ;;
+    -i)
+      need_arg "$@"
+      [[ -f $2 && -r $2 ]] || usage_error "Identity file not found or not readable: $2"
+      IDENTITY=$2
+      shift 2
+      ;;
+    -J)
+      need_arg "$@"
+      [[ -n $2 && $2 != -* ]] || usage_error "Invalid jump host: $2"
+      JUMP=$2
+      shift 2
+      ;;
+    -o)
+      need_arg "$@"
+      validate_ssh_option "$2"
+      USER_SSH_OPTS+=(-o "$2")
+      shift 2
+      ;;
+    -f)
+      need_arg "$@"
+      [[ -f $2 && -r $2 ]] || usage_error "Hosts file not found or not readable: $2"
+      HOSTS_FILES+=("$2")
+      shift 2
+      ;;
+    -j)
+      need_arg "$@"
+      if [[ ! $2 =~ ^[0-9]{1,2}$ ]] || ((10#$2 < 1 || 10#$2 > 64)); then
+        usage_error 'Parallel jobs must be a number between 1 and 64'
+      fi
+      JOBS=$((10#$2))
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -V | --version)
+      printf 'remotecheck %s\n' "$VERSION"
+      exit 0
+      ;;
+    --)
+      shift
+      TARGETS+=("$@")
+      break
+      ;;
+    -*) usage_error "Unknown option: $1" ;;
+    *)
+      TARGETS+=("$1")
+      shift
+      ;;
+    esac
+  done
+}
+
+# Append targets from a hosts file: one per line, blank lines and # comments ignored.
+read_hosts_file() {
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%%#*}
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n $line ]] && TARGETS+=("$line")
+  done <"$1"
+}
+
+# Validate targets and drop duplicates while keeping their order.
+normalize_targets() {
+  local t u seen=() out=() dup
+  for t in "${TARGETS[@]}"; do
+    [[ $t != -* && $t != *[[:space:]]* ]] || usage_error "Invalid SSH target: $t"
+    dup=0
+    for u in "${seen[@]}"; do
+      if [[ $u == "$t" ]]; then dup=1; break; fi
+    done
+    if ((!dup)); then
+      seen+=("$t")
+      out+=("$t")
     fi
+  done
+  TARGETS=("${out[@]}")
+}
+
+# Prompt on the terminal without echo; sets PROMPTED_PW (empty when skipped
+# or when no terminal is available).
+prompt_password() {
+  PROMPTED_PW=''
+  if { : >/dev/tty; } 2>/dev/null; then
+    printf '%s' "$1" >/dev/tty
+    IFS= read -r -s PROMPTED_PW </dev/tty || PROMPTED_PW=''
+    printf '\r\033[2K' >/dev/tty
+    return 0
   fi
-  unset sudo_password
-fi
+  return 1
+}
 
-# Decide color locally: SSH does not allocate a remote TTY by default, but
-# ANSI colors still work when this script's output is going to a local terminal.
-COLOR_OUTPUT=0
-if [[ $JSON != 1 && -t 1 && -z ${NO_COLOR:-} ]]; then
-  COLOR_OUTPUT=1
-fi
+json_str() {
+  RC_S=$1 awk 'BEGIN {
+    s = ENVIRON["RC_S"]
+    gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); gsub(/[\001-\037\177]/, " ", s)
+    printf "\"%s\"", s
+  }'
+}
 
-# Remote collector: delivered on SSH stdin. No generated/nested bash -c command.
-# Values in the SSH command string are intentionally expanded locally and passed as remote environment assignments.
-# shellcheck disable=SC2029
-ssh "${SSH_OPTS[@]}" "$TARGET" "REMOTE_SUDO=$SUDO_AVAILABLE REMOTE_SUDO_STATUS='$SUDO_STATUS' REMOTE_JSON=$JSON REMOTE_TTY=$COLOR_OUTPUT bash -s" <<'REMOTE_COLLECTOR'
+cleanup() {
+  local sock
+  [[ -n $CTL_DIR && -d $CTL_DIR ]] || return 0
+  for sock in "$CTL_DIR"/*.sock; do
+    if [[ -S $sock ]]; then
+      ssh -o ControlPath="$sock" -O exit remotecheck-cleanup >/dev/null 2>&1
+    fi
+  done
+  rm -rf -- "$CTL_DIR"
+}
+
+on_signal() {
+  local pids
+  pids=$(jobs -p)
+  # shellcheck disable=SC2086
+  [[ -n $pids ]] && kill $pids 2>/dev/null
+  exit "$1"
+}
+
+# Remote collector. It is delivered on SSH stdin and read by "bash -s".
+# The first line sent (see scan_host) reads the next stdin line - the sudo
+# password, or an empty line - into a shell variable. Bash reads a piped
+# script line by line, so that line is consumed as data and never parsed as a
+# command. Because the password lives in the same session as the privileged
+# commands, sudo works even though cached credentials do not carry over
+# between SSH sessions.
+collector_script() {
+  cat <<'REMOTE_COLLECTOR'
 set -o pipefail
-USE_SUDO=${REMOTE_SUDO:-0}
-SUDO_STATUS=${REMOTE_SUDO_STATUS:-'Unavailable or skipped; running without sudo'}
-JSON=${REMOTE_JSON:-0}
+export LC_ALL=C
 
+SUDO_STATE=${REMOTE_SUDO_STATE:-skipped}
+case $SUDO_STATE in
+    disabled | nopasswd | password | rejected | missing | skipped) ;;
+    *) SUDO_STATE=skipped ;;
+esac
+[[ $SUDO_STATE == password ]] || SUDO_PW=''
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+TMO=()
+if have timeout; then TMO=(timeout 60); fi
+
+# Record format (tab-separated), rendered by the local side:
+#   S  id  title  kv                          start a property/value section
+#   S  id  title  table  col_id=Label ...     start a multi-column section
+#   K  key_id  label  value                   property row (kv sections)
+#   R  value ...                              data row (table sections)
+#   E  text                                   section message (no data)
+#   M  key  value                             report metadata
+#   N  text                                   closing note
 clean() {
-    local v=${1:-}
+    local v=${1-}
+    v=${v//$'\t'/ }
     v=${v//$'\n'/ }
     v=${v//$'\r'/ }
-    v=${v//|//}
     printf '%s' "$v"
 }
-
-TABLE_KEY_WIDTH=28
-TABLE_VALUE_WIDTH=54
-USE_COLOR=0
-if [[ $JSON != 1 && ${REMOTE_TTY:-0} == 1 ]]; then
-    USE_COLOR=1
-fi
-
-blue() {
-    if ((USE_COLOR)); then
-        printf '\033[1;34m%s\033[0m' "$1"
-    else
-        printf '%s' "$1"
-    fi
-}
-
-cyan() {
-    if ((USE_COLOR)); then
-        printf '\033[1;36m%s\033[0m' "$1"
-    else
-        printf '%s' "$1"
-    fi
-}
-
-table_border() {
-    printf '+-%*s-+-%*s-+\n' "$TABLE_KEY_WIDTH" '' "$TABLE_VALUE_WIDTH" '' |
-        tr ' ' '-'
-}
-
-table_header() {
-    local heading=$1
-    if [[ $heading == *PROPERTY* && $heading == *VALUE* ]]; then
-        table_border
-        printf '| '
-        cyan "$(printf '%-*s' "$TABLE_KEY_WIDTH" 'PROPERTY')"
-        printf ' | '
-        cyan "$(printf '%-*s' "$TABLE_VALUE_WIDTH" 'VALUE')"
-        printf ' |\n'
-        table_border
-    else
-        blue "$heading"
-        printf '\n'
-        printf '%s\n' '----------------------------------------------------------------------------------------------------'
-    fi
-}
-
-section() {
+section_kv() { printf 'S\t%s\t%s\tkv\n' "$1" "$2"; }
+section_table() {
+    printf 'S\t%s\t%s\ttable' "$1" "$2"
+    shift 2
+    printf '\t%s' "$@"
     printf '\n'
-    blue "$1"
-    printf '\n'
-    printf '%s\n' '------------------------------'
 }
-
+kv() { printf 'K\t%s\t%s\t%s\n' "$1" "$2" "$(clean "$3")"; }
 row() {
-    local key value
-    key=$(clean "$1")
-    value=$(clean "$2")
-    printf '| %-*.*s | %-*.*s |\n' \
-        "$TABLE_KEY_WIDTH" "$TABLE_KEY_WIDTH" "$key" \
-        "$TABLE_VALUE_WIDTH" "$TABLE_VALUE_WIDTH" "$value"
-}
-
-# Fixed-width boxed table helpers for multi-column sections.
-multi_border() {
-    local widths=("$@") i
-    printf '+'
-    for i in "${widths[@]}"; do
-        printf '%*s+' "$((i + 2))" '' | tr ' ' '-'
-    done
+    local field
+    printf 'R'
+    for field in "$@"; do printf '\t%s' "$(clean "$field")"; done
     printf '\n'
 }
+msg() { printf 'E\t%s\n' "$(clean "$1")"; }
+meta() { printf 'M\t%s\t%s\n' "$1" "$(clean "$2")"; }
+note() { printf 'N\t%s\n' "$(clean "$1")"; }
 
-multi_header() {
-    local widths=("$1") # unused placeholder for Bash 4 compatibility
+with_timeout() {
+    local secs=$1
     shift
-    local labels=("$@") i width
-    local widths_list=()
-    # Widths are passed as alternating width,label pairs.
-    for ((i=0; i<${#labels[@]}; i+=2)); do widths_list+=("${labels[i]}"); done
-    multi_border "${widths_list[@]}"
-    printf '|'
-    for ((i=0; i<${#labels[@]}; i+=2)); do
-        width=${labels[i]}
-        printf ' '
-        cyan "$(printf '%-*.*s' "$width" "$width" "${labels[i+1]}")"
-        printf ' |'
-    done
-    printf '\n'
-    multi_border "${widths_list[@]}"
+    if have timeout; then timeout "$secs" "$@"; else "$@"; fi
 }
 
-multi_row() {
-    local widths_csv=$1
-    shift
-    local widths=() values=("$@") i width value
-    IFS=, read -r -a widths <<< "$widths_csv"
-    printf '|'
-    for ((i=0; i<${#widths[@]}; i++)); do
-        width=${widths[i]}
-        value=$(clean "${values[i]:-}")
-        printf ' %-*.*s |' "$width" "$width" "$value"
-    done
-    printf '\n'
-}
-have() { command -v "$1" >/dev/null 2>&1; }
+# Run a command with sudo when available. In password mode the password is
+# piped to sudo -S; if sudo has cached credentials it is not read and the
+# command receives it on stdin instead, so only use commands that ignore stdin.
 run_priv() {
-    if [[ $USE_SUDO == 1 ]]; then sudo -n -- "$@" 2>/dev/null; else "$@" 2>/dev/null; fi
+    case $SUDO_STATE in
+        nopasswd) sudo -n -- "$@" </dev/null 2>/dev/null ;;
+        password) printf '%s\n' "$SUDO_PW" | sudo -S -p '' -- "$@" 2>/dev/null ;;
+        *) "$@" </dev/null 2>/dev/null ;;
+    esac
 }
 
-report_file=$(mktemp) || exit 1
-trap 'rm -f "$report_file"' EXIT
-# REMOTE_TTY is passed from the local terminal by the SSH command.
+sudo_text() {
+    case $1 in
+        nopasswd) printf 'Passwordless sudo available' ;;
+        password) printf 'Sudo authenticated with supplied password' ;;
+        rejected) printf 'Password rejected; running without sudo' ;;
+        disabled) printf 'Disabled with --no-sudo; running without sudo' ;;
+        missing) printf 'sudo not installed; running without sudo' ;;
+        failed) printf 'sudo could not run commands; running without sudo' ;;
+        *) printf 'Skipped or unavailable; running without sudo' ;;
+    esac
+}
 
-{
-    printf '%s\n' 'remotecheck report'
-    printf '\n'
-    table_header 'PROPERTY                       | VALUE'
-    row 'Host' "$(hostname 2>/dev/null || printf unknown)"
-    row 'FQDN' "$(hostname -f 2>/dev/null || printf unavailable)"
-    row 'Current user' "$(id -un 2>/dev/null || printf unknown)"
-    row 'User ID / groups' "$(id 2>/dev/null || printf unavailable)"
-    row 'Collected at' "$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date)"
-    row 'Sudo status' "$SUDO_STATUS"
-    table_border
+# status_for_count COUNT [STATUS_WHEN_ZERO]
+status_for_count() {
+    if (($1 > 0)); then printf 'REVIEW'; else printf '%s' "${2:-PASS}"; fi
+}
 
-    section 'Operating system'
-    table_header 'PROPERTY                       | VALUE'
+# status_for_pct PERCENT REVIEW_AT WARNING_AT
+status_for_pct() {
+    if (($1 >= $3)); then printf 'WARNING'
+    elif (($1 >= $2)); then printf 'REVIEW'
+    else printf 'PASS'; fi
+}
+
+# Print up to three lines joined by ", ", plus "..." when there are more.
+first_three() {
+    awk 'NF { if (n < 3) printf "%s%s", (n ? ", " : ""), $0; n++ } END { if (n > 3) printf ", ..." }'
+}
+
+count_lines() {
+    awk 'NF {n++} END {print n+0}'
+}
+
+# Classify a listening address as all, loopback or specific.
+addr_scope() {
+    local a=${1%:*}
+    a=${a%%%*}
+    case $a in
+        '*' | 0.0.0.0 | '[::]' | '::' | '[::]'*) printf 'all' ;;
+        127.* | '[::1]' | '::1') printf 'loopback' ;;
+        *) printf 'specific' ;;
+    esac
+}
+
+# Approximate effective sshd settings from the config files when "sshd -T"
+# is not possible. Assumes the common layout where sshd_config includes
+# sshd_config.d/*.conf at the top (first value wins); Match blocks are skipped.
+sshd_config_from_files() {
+    local f files=()
+    for f in /etc/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config; do
+        [[ -f $f && -r $f ]] && files+=("$f")
+    done
+    ((${#files[@]})) || return 1
+    awk '
+        FNR == 1 { in_match = 0 }
+        { line = $0; sub(/^[[:space:]]*/, "", line); sub(/[[:space:]]*=[[:space:]]*/, " ", line); $0 = line }
+        /^#/ || NF < 2 { next }
+        tolower($1) == "match" { in_match = 1 }
+        in_match { next }
+        { key = tolower($1); if (!(key in seen)) { seen[key] = 1; print key, tolower($2) } }
+    ' "${files[@]}"
+    return 0
+}
+
+apt_lists_age() {
+    local f stamp=0 t now
+    for f in /var/lib/apt/periodic/update-success-stamp /var/cache/apt/pkgcache.bin /var/lib/apt/lists; do
+        t=$(stat -c %Y "$f" 2>/dev/null) || continue
+        ((t > stamp)) && stamp=$t
+    done
+    ((stamp > 0)) || { printf 'unknown'; return; }
+    now=$(date +%s)
+    printf '%s day(s) ago (approximate)' "$(((now - stamp) / 86400))"
+}
+
+main() {
+    local PRIV=0 data line count s n rc
+    local iface state addresses proto sock_state local_addr peer_addr process_info scope port exposed=''
+    local unit load active sub description proc_user proc_pid proc_command
+
+    if [[ $SUDO_STATE == nopasswd || $SUDO_STATE == password ]]; then
+        if run_priv true; then
+            PRIV=1
+        else
+            SUDO_STATE=failed
+            SUDO_PW=''
+        fi
+    fi
+    meta sudo_state "$SUDO_STATE"
+    meta privileged "$PRIV"
+
+    # ---- Host -------------------------------------------------------------
+    section_kv host 'Host'
+    kv host 'Host' "$(hostname 2>/dev/null || printf unknown)"
+    kv fqdn 'FQDN' "$(with_timeout 3 hostname -f 2>/dev/null || printf unavailable)"
+    kv user 'Current user' "$(id -un 2>/dev/null || printf unknown)"
+    kv id 'User ID / groups' "$(id 2>/dev/null || printf unavailable)"
+    kv collected_at 'Collected at' "$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date)"
+    kv sudo 'Sudo status' "$(sudo_text "$SUDO_STATE")"
+
+    # ---- Operating system -------------------------------------------------
+    section_kv os 'Operating system'
     if [[ -r /etc/os-release ]]; then
-        . /etc/os-release
-        row 'Distribution' "${PRETTY_NAME:-${NAME:-unknown}}"
-        row 'Version ID' "${VERSION_ID:-unknown}"
+        # Sourced in subshells so its variables do not leak into the collector.
+        # shellcheck disable=SC1091
+        kv distribution 'Distribution' "$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-${NAME:-unknown}}")"
+        # shellcheck disable=SC1091
+        kv version_id 'Version ID' "$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-unknown}")"
     else
-        row 'Distribution' 'Cannot read /etc/os-release'
+        kv distribution 'Distribution' 'Cannot read /etc/os-release'
     fi
-    row 'Kernel' "$(uname -srmo 2>/dev/null || uname -a)"
-    row 'Architecture' "$(uname -m 2>/dev/null || printf unknown)"
-    row 'Uptime' "$(uptime -p 2>/dev/null || uptime 2>/dev/null || printf unavailable)"
-    table_border
+    kv kernel 'Kernel' "$(uname -srmo 2>/dev/null || uname -srm 2>/dev/null || printf unknown)"
+    kv architecture 'Architecture' "$(uname -m 2>/dev/null || printf unknown)"
+    kv uptime 'Uptime' "$(uptime -p 2>/dev/null || uptime 2>/dev/null || printf unavailable)"
 
-    section 'Network interfaces'
-    multi_header ignored 14 INTERFACE 8 STATE 48 ADDRESSES
+    # ---- System resources -------------------------------------------------
+    section_table resources 'System resources' 'check=CHECK' 'status=STATUS' 'detail=DETAIL'
+    if [[ -r /proc/meminfo ]]; then
+        local mem_total mem_avail swap_total swap_used pct
+        read -r mem_total mem_avail swap_total swap_used <<<"$(awk '
+            /^MemTotal:/ {t = $2} /^MemAvailable:/ {a = $2; has_a = 1}
+            /^MemFree:/ {f = $2} /^Buffers:/ {b = $2} /^Cached:/ {c = $2}
+            /^SwapTotal:/ {st = $2} /^SwapFree:/ {sf = $2}
+            END { if (!has_a) a = f + b + c; printf "%d %d %d %d", t / 1024, a / 1024, st / 1024, (st - sf) / 1024 }
+        ' /proc/meminfo)"
+        if ((mem_total > 0)); then
+            pct=$((mem_avail * 100 / mem_total))
+            if ((pct < 10)); then s=WARNING; elif ((pct < 20)); then s=REVIEW; else s=PASS; fi
+            row 'Memory' "$s" "$mem_avail MiB available of $mem_total MiB ($pct%)"
+        else
+            row 'Memory' 'INCONCLUSIVE' 'could not parse /proc/meminfo'
+        fi
+        if ((swap_total == 0)); then
+            row 'Swap' 'INFO' 'no swap configured'
+        else
+            pct=$((swap_used * 100 / swap_total))
+            row 'Swap' "$(status_for_pct "$pct" 80 101)" "$swap_used MiB used of $swap_total MiB ($pct%)"
+        fi
+    else
+        row 'Memory' 'INCONCLUSIVE' '/proc/meminfo unreadable'
+    fi
+
+    if [[ -r /proc/loadavg ]]; then
+        local load1 load5 load15 ncpu
+        read -r load1 load5 load15 _ </proc/loadavg
+        ncpu=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || printf 1)
+        s=$(awk -v l="$load5" -v c="$ncpu" 'BEGIN { print (l > 2 * c) ? "REVIEW" : "INFO" }')
+        row 'Load average' "$s" "$load1 $load5 $load15 (1/5/15 min) on $ncpu CPU(s)"
+    fi
+
+    if have df; then
+        local dfs size used avail usep mnt
+        local df_skip='/run*|/snap*|/dev|/dev/*|/sys*|/proc*|/var/lib/docker*|/var/lib/containers*'
+        data=$(df -hP -x tmpfs -x devtmpfs -x squashfs -x efivarfs 2>/dev/null || df -hP 2>/dev/null)
+        while read -r dfs size used avail usep mnt; do
+            [[ -n $mnt && $usep == *% ]] || continue
+            # shellcheck disable=SC2254
+            case $mnt in $df_skip) continue ;; esac
+            pct=${usep%\%}
+            [[ $pct =~ ^[0-9]+$ ]] || continue
+            row "Disk $mnt" "$(status_for_pct "$pct" 80 90)" "$usep used of $size ($dfs)"
+        done <<<"$(awk 'NR > 1' <<<"$data")"
+
+        # Inode usage: only reported when it is getting high.
+        data=$(df -iP -x tmpfs -x devtmpfs -x squashfs -x efivarfs 2>/dev/null || df -iP 2>/dev/null)
+        while read -r dfs size used avail usep mnt; do
+            [[ -n $mnt && $usep == *% ]] || continue
+            # shellcheck disable=SC2254
+            case $mnt in $df_skip) continue ;; esac
+            pct=${usep%\%}
+            if [[ ! $pct =~ ^[0-9]+$ ]] || ((pct < 80)); then continue; fi
+            row "Inodes $mnt" "$(status_for_pct "$pct" 80 90)" "$usep of inodes used ($dfs)"
+        done <<<"$(awk 'NR > 1' <<<"$data")"
+    else
+        row 'Disk usage' 'INCONCLUSIVE' 'df command unavailable'
+    fi
+
+    # ---- Network interfaces -----------------------------------------------
+    section_table network_interfaces 'Network interfaces' \
+        'interface=INTERFACE' 'state=STATE' 'addresses=ADDRESSES'
     if have ip; then
-        interface_data=$(ip -brief address 2>/dev/null || true)
-        if [[ -n $interface_data ]]; then
+        data=$(ip -brief address 2>/dev/null)
+        if [[ -n $data ]]; then
             while read -r iface state addresses; do
-                multi_row '14,8,48' "$iface" "$state" "$addresses"
-            done <<< "$interface_data"
+                row "$iface" "$state" "$addresses"
+            done <<<"$data"
         else
-            multi_row '14,8,48' 'Network' 'unknown' 'Query failed or no interfaces returned'
+            msg 'Query failed or no interfaces returned'
         fi
     else
-        multi_row '14,8,48' 'Network' 'missing' 'ip command unavailable'
+        msg 'ip command unavailable'
     fi
-    multi_border 14 8 48
 
-    section 'Listening TCP/UDP sockets'
-    multi_header ignored 8 PROTOCOL 10 STATE 30 LOCAL_ADDRESS 30 PEER_ADDRESS 24 PROCESS
+    # ---- Listening sockets ------------------------------------------------
+    section_table listening_sockets 'Listening TCP/UDP sockets' \
+        'protocol=PROTOCOL' 'state=STATE' 'local_address=LOCAL ADDRESS' \
+        'peer_address=PEER ADDRESS' 'scope=SCOPE' 'process=PROCESS'
     if have ss; then
-        socket_data=$(ss -H -lntup 2>/dev/null || ss -H -lntu 2>/dev/null || true)
-        if [[ -n $socket_data ]]; then
-            while IFS= read -r socket_line; do
-                read -r proto state recvq sendq local_addr peer_addr process_info <<< "$socket_line"
-                multi_row '8,10,30,30,24' "$proto" "$state" "$local_addr" "$peer_addr" "${process_info:--}"
-            done <<< "$socket_data"
+        # Older ss versions lack -H (no header); fall back to stripping it.
+        data=$(run_priv ss -H -lntup) || data=$(run_priv ss -lntup | awk 'NR > 1')
+        if [[ -n $data ]]; then
+            while IFS= read -r line; do
+                read -r proto sock_state _ _ local_addr peer_addr process_info <<<"$line"
+                scope=$(addr_scope "$local_addr")
+                row "$proto" "$sock_state" "$local_addr" "$peer_addr" "$scope" "${process_info:--}"
+                if [[ $scope == all ]]; then
+                    port="$proto/${local_addr##*:}"
+                    [[ " $exposed " == *" $port "* ]] || exposed="${exposed:+$exposed }$port"
+                fi
+            done <<<"$data"
         else
-            multi_row '8,10,30,30,24' 'sockets' 'none' 'No listeners found' '-'
+            msg 'No listening sockets found'
         fi
     else
-        multi_row '8,10,30,30,24' 'ss' 'missing' 'ss command unavailable' '-'
+        msg 'ss command unavailable'
     fi
-    multi_border 8 10 30 30 24
 
-    section 'Running systemd services'
-    multi_header ignored 28 UNIT 10 STATE 52 DESCRIPTION
+    # ---- systemd ------------------------------------------------------------
+    section_table running_services 'Running systemd services' \
+        'unit=UNIT' 'state=STATE' 'description=DESCRIPTION'
     if have systemctl; then
-        running_units=$(systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null || true)
-        if [[ -n $running_units ]]; then
+        data=$(systemctl list-units --type=service --state=running --no-legend --no-pager --plain 2>/dev/null)
+        if [[ -n $data ]]; then
             while read -r unit load active sub description; do
-                multi_row '28,10,52' "$unit" "$active" "$description"
-            done <<< "$running_units"
+                row "$unit" "$sub" "$description"
+            done <<<"$data"
         else
-            multi_row '28,10,52' 'Services' 'unknown' 'No running services reported'
+            msg 'No running services reported'
         fi
     else
-        multi_row '28,10,52' 'systemctl' 'missing' 'systemctl command unavailable'
+        msg 'systemctl command unavailable'
     fi
-    multi_border 28 10 52
 
-    section 'Failed systemd units'
-    multi_header ignored 28 UNIT 10 LOAD 11 ACTIVE 11 SUB 40 DESCRIPTION
+    section_table failed_units 'Failed systemd units' \
+        'unit=UNIT' 'load=LOAD' 'active=ACTIVE' 'sub=SUB' 'description=DESCRIPTION'
     if have systemctl; then
-        failed_units=$(systemctl --failed --no-legend --no-pager 2>/dev/null || true)
-        if [[ -n $failed_units ]]; then
+        # --plain removes the leading status bullet newer systemd prints.
+        data=$(systemctl list-units --failed --no-legend --no-pager --plain 2>/dev/null)
+        if [[ -n $data ]]; then
             while read -r unit load active sub description; do
-                multi_row '28,10,11,11,40' "$unit" "$load" "$active" "$sub" "$description"
-            done <<< "$failed_units"
+                row "$unit" "$load" "$active" "$sub" "$description"
+            done <<<"$data"
         else
-            multi_row '28,10,11,11,40' 'systemd' '-' '-' '-' 'No failed units reported'
+            msg 'No failed units reported'
         fi
     else
-        multi_row '28,10,11,11,40' 'systemctl' '-' '-' '-' 'systemctl unavailable'
+        msg 'systemctl command unavailable'
     fi
-    multi_border 28 10 11 11 40
 
-    section 'Process sample'
-    multi_header ignored 24 USER 10 PID 54 COMMAND
+    # ---- Processes ----------------------------------------------------------
+    section_table processes 'Process sample (top 15 by CPU)' \
+        'user=USER' 'pid=PID' 'command=COMMAND'
     if have ps; then
-        ps -eo user:24,pid,args --sort=-%cpu 2>/dev/null | tail -n +2 | head -n 15 |
+        data=$(ps -eo user:32,pid,args --sort=-pcpu 2>/dev/null | awk 'NR > 1 && NR <= 16')
+        if [[ -n $data ]]; then
             while read -r proc_user proc_pid proc_command; do
-                multi_row '24,10,54' "$proc_user" "$proc_pid" "$proc_command"
-            done
+                row "$proc_user" "$proc_pid" "$proc_command"
+            done <<<"$data"
+        else
+            msg 'ps returned no data'
+        fi
     else
-        multi_row '24,10,54' 'processes' '-' 'ps command unavailable'
+        msg 'ps command unavailable'
     fi
-    multi_border 24 10 54
 
-    section 'Basic security checks'
-    multi_header ignored 28 CHECK 54 RESULT
-    sshd_bin=''
-    for candidate in /usr/sbin/sshd /usr/bin/sshd; do
+    # ---- Basic security checks ------------------------------------------------
+    section_table security_checks 'Basic security checks' \
+        'check=CHECK' 'status=STATUS' 'detail=DETAIL'
+
+    # SSH configuration
+    local sshd_bin='' candidate sshd_cfg='' sshd_source='' from_files=0
+    for candidate in /usr/sbin/sshd /usr/bin/sshd /usr/local/sbin/sshd; do
         if [[ -x $candidate ]]; then sshd_bin=$candidate; break; fi
     done
-
     if [[ -n $sshd_bin ]]; then
-        sshd_config=$(run_priv "$sshd_bin" -T || true)
-        if [[ -n $sshd_config ]]; then
-            permit_root=$(awk '$1 == "permitrootlogin" {print $2; exit}' <<< "$sshd_config")
-            password_auth=$(awk '$1 == "passwordauthentication" {print $2; exit}' <<< "$sshd_config")
-
-            # Use if/elif rather than case patterns to keep this block simple.
-            if [[ $permit_root == no ]]; then
-                row 'SSH root login' 'PASS - PermitRootLogin no'
-            elif [[ $permit_root == prohibit-password || $permit_root == without-password ]]; then
-                row 'SSH root login' 'REVIEW - key-based root login may be allowed'
-            elif [[ $permit_root == yes ]]; then
-                row 'SSH root login' 'WARNING - PermitRootLogin yes'
-            else
-                row 'SSH root login' 'INCONCLUSIVE - value unavailable'
-            fi
-
-            if [[ $password_auth == no ]]; then
-                row 'SSH password authentication' 'INFO - disabled'
-            elif [[ $password_auth == yes ]]; then
-                row 'SSH password authentication' 'REVIEW - enabled'
-            else
-                row 'SSH password authentication' 'INCONCLUSIVE - value unavailable'
-            fi
-        else
-            row 'SSH configuration' 'INCONCLUSIVE - could not read effective configuration'
-        fi
-    else
-        row 'SSH configuration' 'INCONCLUSIVE - sshd binary not found'
+        sshd_cfg=$(run_priv "$sshd_bin" -T)
+        [[ -n $sshd_cfg ]] && sshd_source='sshd -T (Match blocks not evaluated)'
+    fi
+    if [[ -z $sshd_cfg ]] && sshd_cfg=$(sshd_config_from_files); then
+        from_files=1
+        sshd_source='config files (approximate; defaults assumed)'
     fi
 
-    multi_border 28 54
-
-    section 'Package updates'
-    multi_header ignored 28 CHECK 54 RESULT
-    if have apt-get; then
-        if [[ $USE_SUDO == 1 ]]; then
-            updates=$(run_priv apt-get -s upgrade | awk '/^Inst / {n++} END {print n+0}')
-            row 'Pending apt updates' "${updates:-unknown} package(s) indicated by simulation"
-        else
-            row 'Pending apt updates' 'SKIPPED - sudo unavailable'
+    if [[ -n $sshd_source ]]; then
+        local permit_root password_auth root_note='' pw_note=''
+        permit_root=$(awk '$1 == "permitrootlogin" {print $2; exit}' <<<"$sshd_cfg")
+        password_auth=$(awk '$1 == "passwordauthentication" {print $2; exit}' <<<"$sshd_cfg")
+        if ((from_files)); then
+            [[ -n $permit_root ]] || { permit_root=prohibit-password; root_note=' (default)'; }
+            [[ -n $password_auth ]] || { password_auth=yes; pw_note=' (default)'; }
         fi
-    elif have dnf; then
-        if [[ $USE_SUDO == 1 ]]; then row 'Pending dnf updates' 'Detected dnf; verify with dnf check-update'; else row 'Pending dnf updates' 'SKIPPED - sudo unavailable'; fi
-    elif have yum; then
-        row 'Pending yum updates' 'Verify manually with yum check-update'
+
+        case $permit_root in
+            no) row 'SSH root login' 'PASS' "PermitRootLogin no$root_note" ;;
+            prohibit-password | without-password | forced-commands-only)
+                row 'SSH root login' 'REVIEW' "PermitRootLogin $permit_root$root_note; keys allowed" ;;
+            yes) row 'SSH root login' 'WARNING' "PermitRootLogin yes$root_note" ;;
+            *) row 'SSH root login' 'INCONCLUSIVE' 'value unavailable' ;;
+        esac
+
+        case $password_auth in
+            no) row 'SSH password authentication' 'INFO' "disabled$pw_note" ;;
+            yes) row 'SSH password authentication' 'REVIEW' "enabled$pw_note" ;;
+            *) row 'SSH password authentication' 'INCONCLUSIVE' 'value unavailable' ;;
+        esac
+        row 'SSH configuration source' 'INFO' "$sshd_source"
+    elif [[ -n $sshd_bin ]]; then
+        row 'SSH configuration' 'INCONCLUSIVE' 'could not read effective configuration or config files'
     else
-        row 'Package updates' 'No supported package manager detected'
+        row 'SSH configuration' 'INCONCLUSIVE' 'sshd binary not found and config files unreadable'
     fi
 
-    multi_border 28 54
+    # Accounts
+    local uid0 empty_pw
+    uid0=$(awk -F: '$3 == 0 { s = s (s ? ", " : "") $1 } END { print s }' /etc/passwd 2>/dev/null)
+    if [[ -z $uid0 ]]; then
+        row 'Accounts with UID 0' 'INCONCLUSIVE' 'could not read /etc/passwd'
+    elif [[ $uid0 == root ]]; then
+        row 'Accounts with UID 0' 'PASS' 'only root'
+    else
+        row 'Accounts with UID 0' 'WARNING' "$uid0"
+    fi
 
-    section 'World-writable temporary files'
-    multi_header ignored 28 CHECK 54 RESULT
+    if ((PRIV)); then
+        # shellcheck disable=SC2016
+        if empty_pw=$(run_priv awk -F: '$2 == "" { s = s (s ? ", " : "") $1 } END { print s }' /etc/shadow); then
+            if [[ -z $empty_pw ]]; then
+                row 'Accounts with empty password' 'PASS' 'none'
+            else
+                row 'Accounts with empty password' 'WARNING' "$empty_pw"
+            fi
+        else
+            row 'Accounts with empty password' 'INCONCLUSIVE' 'could not read /etc/shadow'
+        fi
+    else
+        row 'Accounts with empty password' 'INCONCLUSIVE' 'requires sudo'
+    fi
+
+    # Firewall
+    if [[ -r /etc/ufw/ufw.conf ]] && grep -qiE '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*yes' /etc/ufw/ufw.conf; then
+        row 'Firewall' 'PASS' 'ufw enabled'
+    elif have systemctl && [[ $(systemctl is-active firewalld 2>/dev/null) == active ]]; then
+        row 'Firewall' 'PASS' 'firewalld running'
+    elif ((PRIV)); then
+        local fw_tool='' fw_rules=0 fw_drop=0
+        if have nft && data=$(run_priv nft list ruleset); then
+            fw_tool=nftables
+            fw_rules=$(awk '/^[[:space:]]+(ip|ip6|tcp|udp|icmp|icmpv6|meta|ct|iif|iifname|oif|oifname|th|counter|jump|goto|accept|drop|reject)([[:space:]]|$)/ {n++} END {print n+0}' <<<"$data")
+            grep -qE 'hook input.*policy drop' <<<"$data" && fw_drop=1
+        elif have iptables && data=$(run_priv iptables -S); then
+            fw_tool=iptables
+            fw_rules=$(awk '/^-A / {n++} END {print n+0}' <<<"$data")
+            grep -q '^-P INPUT DROP' <<<"$data" && fw_drop=1
+        fi
+        if [[ -z $fw_tool ]]; then
+            row 'Firewall' 'INCONCLUSIVE' 'no ufw/firewalld; nft and iptables unavailable'
+        elif ((fw_drop)); then
+            row 'Firewall' 'PASS' "$fw_tool: input policy drop, $fw_rules rule(s)"
+        elif ((fw_rules > 0)); then
+            row 'Firewall' 'REVIEW' "$fw_tool: $fw_rules rule(s), input policy accept"
+        else
+            row 'Firewall' 'REVIEW' 'no active firewall rules found'
+        fi
+    else
+        row 'Firewall' 'INCONCLUSIVE' 'ufw/firewalld not active; nft/iptables need sudo'
+    fi
+
+    # Mandatory access control
+    local se_mode='' aa_enabled=''
+    if have getenforce; then
+        se_mode=$(getenforce 2>/dev/null)
+        case $se_mode in
+            Enforcing) row 'Mandatory access control' 'PASS' 'SELinux enforcing' ;;
+            Permissive) row 'Mandatory access control' 'REVIEW' 'SELinux permissive' ;;
+            Disabled) row 'Mandatory access control' 'REVIEW' 'SELinux disabled' ;;
+            *) row 'Mandatory access control' 'INCONCLUSIVE' 'getenforce failed' ;;
+        esac
+    else
+        [[ -r /sys/module/apparmor/parameters/enabled ]] && read -r aa_enabled </sys/module/apparmor/parameters/enabled
+        if [[ $aa_enabled == Y ]]; then
+            if ((PRIV)) && data=$(run_priv cat /sys/kernel/security/apparmor/profiles); then
+                n=$(awk '/\(enforce\)/ {n++} END {print n+0}' <<<"$data")
+                if ((n > 0)); then
+                    row 'Mandatory access control' 'PASS' "AppArmor enabled, $n profile(s) enforcing"
+                else
+                    row 'Mandatory access control' 'REVIEW' 'AppArmor enabled, no profiles enforcing'
+                fi
+            else
+                row 'Mandatory access control' 'INFO' 'AppArmor enabled (profile status needs sudo)'
+            fi
+        else
+            row 'Mandatory access control' 'REVIEW' 'neither SELinux nor AppArmor detected'
+        fi
+    fi
+
+    # Reboot required
+    if [[ -e /var/run/reboot-required ]]; then
+        n=0
+        [[ -r /var/run/reboot-required.pkgs ]] && n=$(count_lines </var/run/reboot-required.pkgs)
+        row 'Reboot required' 'REVIEW' "reboot-required flag set ($n package(s))"
+    elif have needs-restarting; then
+        run_priv needs-restarting -r >/dev/null
+        rc=$?
+        case $rc in
+            0) row 'Reboot required' 'PASS' 'needs-restarting: no reboot needed' ;;
+            1) row 'Reboot required' 'REVIEW' 'needs-restarting: reboot needed' ;;
+            *) row 'Reboot required' 'INCONCLUSIVE' "needs-restarting failed (exit $rc)" ;;
+        esac
+    else
+        local running_kernel newest_kernel d
+        running_kernel=$(uname -r 2>/dev/null)
+        newest_kernel=$(for d in /lib/modules/*/; do [[ -d $d ]] && basename "$d"; done | sort -V | tail -n 1)
+        if [[ -z $running_kernel || -z $newest_kernel || ! -d /lib/modules/$running_kernel ]]; then
+            row 'Reboot required' 'INCONCLUSIVE' 'cannot compare running and installed kernels'
+        elif [[ $newest_kernel == "$running_kernel" ]]; then
+            row 'Reboot required' 'PASS' "running newest installed kernel ($running_kernel)"
+        else
+            row 'Reboot required' 'REVIEW' "running $running_kernel; newer kernel installed: $newest_kernel"
+        fi
+    fi
+
+    # Time synchronization
+    local synced=''
+    if have timedatectl; then
+        synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
+        [[ -n $synced ]] || synced=$(timedatectl status 2>/dev/null | awk -F': *' '/synchronized:/ {print $2; exit}')
+    fi
+    if [[ $synced == yes ]]; then
+        row 'Time synchronization' 'PASS' 'clock synchronized'
+    elif [[ $synced == no ]]; then
+        row 'Time synchronization' 'REVIEW' 'clock not synchronized'
+    elif have chronyc && data=$(chronyc tracking 2>/dev/null); then
+        if grep -q '^Leap status *: Normal' <<<"$data"; then
+            row 'Time synchronization' 'PASS' 'chrony tracking normally'
+        else
+            row 'Time synchronization' 'REVIEW' 'chrony not synchronized'
+        fi
+    else
+        row 'Time synchronization' 'INCONCLUSIVE' 'timedatectl/chronyc unavailable or not responding'
+    fi
+
+    # Services reachable on all interfaces (informational)
+    if have ss; then
+        if [[ -n $exposed ]]; then
+            n=$(wc -w <<<"$exposed")
+            row 'Services on all interfaces' 'INFO' "${n//[!0-9]/}: ${exposed// /, }"
+        else
+            row 'Services on all interfaces' 'INFO' 'none'
+        fi
+    fi
+
+    # ---- Filesystem permission checks ----------------------------------------
+    section_table filesystem_checks 'Filesystem permission checks' \
+        'check=CHECK' 'status=STATUS' 'detail=DETAIL'
     if have find; then
-        if [[ $USE_SUDO == 1 ]]; then
-            writable_count=$(run_priv find /tmp /var/tmp -xdev -type f -perm -0002 -print | wc -l | tr -d ' ')
-            row 'World-writable files' "${writable_count:-0} found"
+        local roots=() root suid_list sticky_list partial='' zero_status=PASS
+        for root in / /home /opt /srv /var /tmp /usr/local; do
+            [[ -d $root ]] && roots+=("$root")
+        done
+        # One walk for both checks; -xdev keeps it on local filesystems and the
+        # timeout keeps very large trees from stalling the scan.
+        data=$(run_priv "${TMO[@]}" find "${roots[@]}" -xdev \
+            \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /snap \
+            -o -path /var/lib/docker -o -path /var/lib/containers -o -path /var/lib/snapd \) -prune \
+            -o -type f -perm /6000 -printf 'S\t%p\n' \
+            -o -type d -perm -0002 ! -perm -1000 -printf 'D\t%p\n')
+        (($? == 124)) && partial=' (timed out after 60s; partial)'
+        ((PRIV)) || zero_status=INCONCLUSIVE
+
+        suid_list=$(awk -F'\t' '$1 == "S" {print $2}' <<<"$data" | sort -u |
+            grep -Ev '^/(usr/)?(bin|sbin|lib|lib32|lib64|libexec)/')
+        count=$(count_lines <<<"$suid_list")
+        if ((count > 0)); then
+            row 'SUID/SGID outside system dirs' 'REVIEW' "$count: $(first_three <<<"$suid_list")$partial"
         else
-            writable_count=$(find /tmp /var/tmp -xdev -type f -perm -0002 -print 2>/dev/null | wc -l | tr -d ' ')
-            row 'Accessible files' "${writable_count:-0} found; results may be incomplete"
+            row 'SUID/SGID outside system dirs' "$zero_status" "none found$partial"
+        fi
+
+        sticky_list=$(awk -F'\t' '$1 == "D" {print $2}' <<<"$data" | sort -u)
+        count=$(count_lines <<<"$sticky_list")
+        if ((count > 0)); then
+            row 'World-writable dirs, no sticky bit' 'REVIEW' "$count: $(first_three <<<"$sticky_list")$partial"
+        else
+            row 'World-writable dirs, no sticky bit' "$zero_status" "none found$partial"
+        fi
+        ((PRIV)) || row 'Coverage' 'INFO' 'directories unreadable without sudo were skipped'
+    else
+        msg 'find command unavailable'
+    fi
+
+    # ---- Package updates ------------------------------------------------------
+    # Update simulations do not need root; results reflect the last metadata refresh.
+    section_table package_updates 'Package updates' \
+        'check=CHECK' 'status=STATUS' 'detail=DETAIL'
+    if have apt-get; then
+        local sim uu_value uu_installed
+        if sim=$(apt-get -s -o Debug::NoLocking=1 dist-upgrade 2>/dev/null </dev/null); then
+            count=$(awk '/^Inst / {n++} END {print n+0}' <<<"$sim")
+            row 'Pending apt updates' "$(status_for_count "$count")" \
+                "$count package(s) upgradable (simulated dist-upgrade)"
+        else
+            row 'Pending apt updates' 'INCONCLUSIVE' 'apt-get simulation failed'
+        fi
+        row 'apt package lists refreshed' 'INFO' "$(apt_lists_age)"
+
+        uu_installed=$(dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null)
+        uu_value=$(apt-config dump 2>/dev/null | awk -F'"' '$1 ~ /^APT::Periodic::Unattended-Upgrade / {v = $2} END {print v}')
+        if [[ $uu_installed != *'install ok installed'* ]]; then
+            row 'Automatic updates' 'REVIEW' 'unattended-upgrades not installed'
+        elif [[ -n $uu_value && $uu_value != 0 ]]; then
+            row 'Automatic updates' 'PASS' 'unattended-upgrades enabled'
+        else
+            row 'Automatic updates' 'REVIEW' 'unattended-upgrades installed but not enabled'
+        fi
+    elif have dnf || have yum; then
+        local pm out timer auto_found=''
+        if have dnf; then pm=dnf; else pm=yum; fi
+        # -C: use cached metadata only (no network, no hangs). Exit 100 = updates.
+        out=$(run_priv "$pm" -q -C check-update)
+        rc=$?
+        case $rc in
+            0) row "Pending $pm updates" 'PASS' '0 package(s) (cached metadata)' ;;
+            100)
+                count=$(awk '/^Obsoleting/ {exit} NF == 3 && $1 ~ /\./ {n++} END {print n+0}' <<<"$out")
+                row "Pending $pm updates" "$(status_for_count "$count")" "$count package(s) (cached metadata)"
+                ;;
+            *) row "Pending $pm updates" 'INCONCLUSIVE' "check-update failed (exit $rc); metadata cache may be missing, run '$pm makecache'" ;;
+        esac
+
+        if have systemctl; then
+            for timer in dnf-automatic.timer dnf-automatic-install.timer dnf5-automatic.timer yum-cron.service; do
+                if [[ $(systemctl is-enabled "$timer" 2>/dev/null) == enabled ]]; then
+                    auto_found=$timer
+                    break
+                fi
+            done
+        fi
+        if [[ -n $auto_found ]]; then
+            row 'Automatic updates' 'PASS' "$auto_found enabled (check that it applies updates)"
+        else
+            row 'Automatic updates' 'REVIEW' 'no dnf-automatic or yum-cron schedule enabled'
         fi
     else
-        row 'File check' 'find command unavailable'
+        row 'Package updates' 'INCONCLUSIVE' 'No supported package manager detected (apt, dnf, yum)'
     fi
 
-    multi_border 28 54
-
-    section 'Scan summary'
-    table_header 'PROPERTY                       | VALUE'
-    if [[ $USE_SUDO == 1 ]]; then
-        row 'Scan status' 'Completed'
-        row 'Sudo status' "$SUDO_STATUS"
-        row 'Coverage' 'Privileged checks attempted where implemented'
+    # ---- World-writable files -------------------------------------------------
+    section_table temp_files 'World-writable temporary files' \
+        'check=CHECK' 'status=STATUS' 'detail=DETAIL'
+    if have find; then
+        # One "." per match, so file names containing newlines count once.
+        count=$(run_priv find /tmp /var/tmp -xdev -type f -perm -0002 -printf '.' | wc -c)
+        count=${count//[!0-9]/}
+        count=${count:-0}
+        if ((PRIV)); then
+            row 'World-writable files' "$(status_for_count "$count")" "$count found in /tmp and /var/tmp"
+        else
+            row 'World-writable files' "$(status_for_count "$count" INCONCLUSIVE)" \
+                "$count found; unreadable directories skipped (no sudo)"
+        fi
     else
-        row 'Scan status' 'Completed with limited privileges'
-        row 'Sudo status' 'Unavailable'
-        row 'Coverage' 'Checks requiring elevated privileges may be incomplete'
+        row 'World-writable files' 'INCONCLUSIVE' 'find command unavailable'
     fi
-    multi_border 28 54
-    printf '\n'
-    if [[ $USE_SUDO == 1 ]]; then
-        printf '%s\n' 'Scan completed with sudo available.'
+
+    # ---- Summary ----------------------------------------------------------------
+    section_kv summary 'Scan summary'
+    if ((PRIV)); then
+        kv status 'Scan status' 'Completed'
+        kv coverage 'Coverage' 'Privileged checks attempted where implemented'
     else
-        printf '%s\n' 'NOTICE: Sudo was unavailable or skipped.'
-        printf '%s\n' 'Accessible checks were completed; some results may be incomplete.'
+        kv status 'Scan status' 'Completed with limited privileges'
+        kv coverage 'Coverage' 'Checks requiring elevated privileges may be incomplete'
     fi
-    printf '%s\n' 'This basic scan is not a guarantee that the host is secure.'
-} >"$report_file"
+    kv sudo 'Sudo status' "$(sudo_text "$SUDO_STATE")"
 
-if [[ $JSON == 1 ]]; then
-    # JSON mode emits readable section blocks without ASCII table borders.
-    # Keep each report line as a JSON string, stripping table rules and
-    # converting pipe-delimited rows into simple readable field lines.
-    awk '
-        function trim(s) {
-            sub(/^[[:space:]]+/, "", s)
-            sub(/[[:space:]]+$/, "", s)
-            return s
-        }
-        function escape_json(s) {
-            gsub(/\\/, "\\\\", s)
-            gsub(/"/, "\\\"", s)
-            gsub(/\t/, "\\t", s)
-            gsub(/\r/, "\\r", s)
-            return s
-        }
-        {
-            line = $0
+    if ((PRIV)); then
+        note 'Scan completed with sudo available.'
+    else
+        note 'NOTICE: Sudo was unavailable or skipped.'
+        note 'Accessible checks were completed; some results may be incomplete.'
+    fi
+    note 'This basic scan is not a guarantee that the host is secure.'
+}
 
-            # Drop ASCII table borders and the repetitive table column headers.
-            if (line ~ /^[+| -]+$/ && line ~ /[-+]/) next
-            if (line ~ /^\|[[:space:]]*PROPERTY[[:space:]]*\|/) next
-            if (line ~ /^\|[[:space:]]*INTERFACE[[:space:]]*\|/) next
-            if (line ~ /^\|[[:space:]]*PROTOCOL[[:space:]]*\|/) next
-            if (line ~ /^\|[[:space:]]*UNIT[[:space:]]*\|/) next
-            if (line ~ /^\|[[:space:]]*USER[[:space:]]*\|/) next
-            if (line ~ /^\|[[:space:]]*CHECK[[:space:]]*\|/) next
-
-            # Convert boxed rows to readable non-table text.
-            if (line ~ /^\|/) {
-                sub(/^\|[[:space:]]*/, "", line)
-                sub(/[[:space:]]*\|[[:space:]]*$/, "", line)
-                gsub(/[[:space:]]*\|[[:space:]]*/, " — ", line)
-                line = trim(line)
-            }
-
-            line = escape_json(line)
-            if (count++) printf ",\n"
-            printf "    \"%s\"", line
-        }
-        END {
-            printf "\n"
-        }
-    ' "$report_file" > "${report_file}.json-lines"
-
-    {
-        printf '{\n  "sudo_available": %s,\n  "report": [\n' \
-            "$([[ ${REMOTE_SUDO:-0} == 1 ]] && printf true || printf false)"
-        cat "${report_file}.json-lines"
-        printf '  ]\n}\n'
-    }
-    rm -f "${report_file}.json-lines"
-else
-    cat "$report_file"
-fi
+# The collector's own stdin is the script itself; keep commands away from it.
+main </dev/null
+SUDO_PW=''
+unset SUDO_PW
 REMOTE_COLLECTOR
+}
+
+# Count WARNING and REVIEW statuses in a record file; prints "warnings reviews".
+count_findings() {
+  awk -F'\t' '
+    $1 == "S" { sc = 0; if ($4 == "table") for (j = 5; j <= NF; j++) if (substr($j, 1, 7) == "status=") sc = j - 3; next }
+    $1 == "R" && sc { if ($sc == "WARNING") w++; else if ($sc == "REVIEW") r++ }
+    END { print w + 0, r + 0 }
+  ' "$1"
+}
+
+# render_report TITLE JSON COLOR < records
+# Renders collector records as boxed tables or as one JSON object.
+render_report() {
+  RC_TITLE=$1 RC_VERSION=$VERSION awk -v json="$2" -v color="$3" '
+    BEGIN { FS = "\t"; nsec = 0; nnote = 0; s = 0; nwarn = 0; nrev = 0; has_status = 0 }
+    $1 == "M" { meta[$2] = $3; next }
+    $1 == "N" { notes[++nnote] = $2; next }
+    $1 == "S" {
+        s = ++nsec
+        sid[s] = $2; stitle[s] = $3; stype[s] = $4; nrow[s] = 0; smsg[s] = ""; scol[s] = 0
+        if ($4 == "kv") {
+            ncol[s] = 2
+            cid[s, 1] = "key";   clabel[s, 1] = "PROPERTY"
+            cid[s, 2] = "value"; clabel[s, 2] = "VALUE"
+        } else {
+            ncol[s] = NF - 4
+            for (j = 1; j <= ncol[s]; j++) {
+                spec = $(j + 4); p = index(spec, "=")
+                cid[s, j] = substr(spec, 1, p - 1); clabel[s, j] = substr(spec, p + 1)
+                if (cid[s, j] == "status") { scol[s] = j; has_status = 1 }
+            }
+        }
+        next
+    }
+    $1 == "K" && s { r = ++nrow[s]; rkey[s, r] = $2; cell[s, r, 1] = $3; cell[s, r, 2] = $4; next }
+    $1 == "R" && s {
+        r = ++nrow[s]
+        for (j = 1; j <= ncol[s]; j++) cell[s, r, j] = (j + 1 <= NF) ? $(j + 1) : ""
+        if (scol[s]) { v = cell[s, r, scol[s]]; if (v == "WARNING") nwarn++; else if (v == "REVIEW") nrev++ }
+        next
+    }
+    $1 == "E" && s { smsg[s] = $2; next }
+
+    function rep(ch, n,   out) { out = ""; while (n-- > 0) out = out ch; return out }
+    function paint(code, str) { return (color && code != "") ? "\033[" code "m" str "\033[0m" : str }
+    function status_code(v) {
+        if (v == "PASS" || v == "ok") return "32"
+        if (v == "REVIEW") return "33"
+        if (v == "WARNING" || v == "FAILED") return "1;31"
+        if (v == "INCONCLUSIVE") return "2"
+        return ""
+    }
+    function fit(str, w) {
+        # Mark truncated values with "..." so missing data is visible.
+        if (length(str) > w) str = (w > 3) ? substr(str, 1, w - 3) "..." : substr(str, 1, w)
+        return sprintf("%-" w "s", str)
+    }
+    function border(s,   j, line) {
+        line = "+"
+        for (j = 1; j <= ncol[s]; j++) line = line rep("-", w[j] + 2) "+"
+        print line
+    }
+    function render_table(   s, j, r, cap, len, total, line, i, v, first) {
+        first = 1
+        if (ENVIRON["RC_TITLE"] != "") { print "remotecheck report: " ENVIRON["RC_TITLE"]; first = 0 }
+        for (s = 1; s <= nsec; s++) {
+            if (!first) print ""
+            first = 0
+            print paint("1;34", stitle[s])
+            for (j = 1; j <= ncol[s]; j++) {
+                cap = (j == ncol[s]) ? 60 : (stype[s] == "kv" ? 28 : 34)
+                w[j] = length(clabel[s, j])
+                for (r = 1; r <= nrow[s]; r++) { len = length(cell[s, r, j]); if (len > w[j]) w[j] = len }
+                if (w[j] > cap) w[j] = (length(clabel[s, j]) > cap) ? length(clabel[s, j]) : cap
+            }
+            total = 3 * (ncol[s] - 1)
+            for (j = 1; j <= ncol[s]; j++) total += w[j]
+            if (smsg[s] != "" && length(smsg[s]) > total) { w[ncol[s]] += length(smsg[s]) - total; total = length(smsg[s]) }
+            border(s)
+            line = "|"
+            for (j = 1; j <= ncol[s]; j++) line = line " " paint("1;36", fit(clabel[s, j], w[j])) " |"
+            print line
+            border(s)
+            for (r = 1; r <= nrow[s]; r++) {
+                line = "|"
+                for (j = 1; j <= ncol[s]; j++) {
+                    v = cell[s, r, j]
+                    if (cid[s, j] == "status" || cid[s, j] == "result") line = line " " paint(status_code(v), fit(v, w[j])) " |"
+                    else line = line " " fit(v, w[j]) " |"
+                }
+                print line
+            }
+            if (smsg[s] != "") print "| " fit(smsg[s], total) " |"
+            border(s)
+        }
+        if (has_status) { print ""; printf "Findings: %d warning(s), %d review item(s)\n", nwarn, nrev }
+        if (nnote) { print ""; for (i = 1; i <= nnote; i++) print notes[i] }
+    }
+
+    function jstr(str) {
+        gsub(/\\/, "\\\\", str)
+        gsub(/"/, "\\\"", str)
+        gsub(/[\001-\037\177]/, " ", str)
+        return "\"" str "\""
+    }
+    function render_json(   s, j, r, i) {
+        printf "{\n"
+        printf "  \"tool\": \"remotecheck\",\n"
+        printf "  \"version\": %s,\n", jstr(ENVIRON["RC_VERSION"])
+        printf "  \"target\": %s,\n", jstr(ENVIRON["RC_TITLE"])
+        printf "  \"sudo\": {\"state\": %s, \"privileged\": %s},\n", jstr(meta["sudo_state"]), (meta["privileged"] == "1") ? "true" : "false"
+        printf "  \"findings\": {\"warning\": %d, \"review\": %d},\n", nwarn, nrev
+        printf "  \"sections\": ["
+        for (s = 1; s <= nsec; s++) {
+            printf "%s\n    {\n      \"id\": %s,\n      \"title\": %s,\n", (s > 1) ? "," : "", jstr(sid[s]), jstr(stitle[s])
+            if (stype[s] == "kv") {
+                printf "      \"data\": {"
+                for (r = 1; r <= nrow[s]; r++) printf "%s\n        %s: %s", (r > 1) ? "," : "", jstr(rkey[s, r]), jstr(cell[s, r, 2])
+                printf "%s}\n", nrow[s] ? "\n      " : ""
+            } else {
+                printf "      \"columns\": ["
+                for (j = 1; j <= ncol[s]; j++) printf "%s%s", (j > 1) ? ", " : "", jstr(cid[s, j])
+                printf "],\n"
+                if (smsg[s] != "") printf "      \"message\": %s,\n", jstr(smsg[s])
+                printf "      \"rows\": ["
+                for (r = 1; r <= nrow[s]; r++) {
+                    printf "%s\n        {", (r > 1) ? "," : ""
+                    for (j = 1; j <= ncol[s]; j++) printf "%s%s: %s", (j > 1) ? ", " : "", jstr(cid[s, j]), jstr(cell[s, r, j])
+                    printf "}"
+                }
+                printf "%s]\n", nrow[s] ? "\n      " : ""
+            }
+            printf "    }"
+        }
+        printf "%s],\n", nsec ? "\n  " : ""
+        printf "  \"notes\": ["
+        for (i = 1; i <= nnote; i++) printf "%s\n    %s", (i > 1) ? "," : "", jstr(notes[i])
+        printf "%s]\n}\n", nnote ? "\n  " : ""
+    }
+
+    END { if (json) render_json(); else render_table() }
+  '
+}
+
+# Record why a host failed; in multi-host mode also report it on stderr.
+fail_host() {
+  printf '%s\n' "$3" >"$CTL_DIR/$1.fail"
+  if ((MULTI)); then progress "[failed] $2: $3"; fi
+}
+
+# Last line of an ssh error log, formatted as ": message" (or nothing).
+last_error() {
+  local line=''
+  [[ -s $1 ]] && line=$(tail -n 1 "$1" | tr -d '\r')
+  [[ -n $line ]] && printf ': %s' "$line"
+}
+
+# scan_host INDEX TARGET
+# Connects, settles sudo, runs the collector and stores its records in
+# $CTL_DIR/INDEX.rec. Creates INDEX.ok on success or INDEX.fail on failure.
+scan_host() {
+  local idx=$1 target=$2
+  local sock=$CTL_DIR/$idx.sock rec=$CTL_DIR/$idx.rec errlog=$CTL_DIR/$idx.err
+  local err_dest=/dev/stderr state=skipped pw='' sudo_rc rc
+  local -a opts=("${USER_SSH_OPTS[@]}"
+    -o ConnectTimeout="$CONNECT_TIMEOUT"
+    -o ControlMaster=auto
+    -o ControlPath="$sock"
+    -o ControlPersist=60)
+  if [[ -n $PORT ]]; then opts+=(-p "$PORT"); fi
+  if [[ -n $IDENTITY ]]; then opts+=(-i "$IDENTITY"); fi
+  if [[ -n $JUMP ]]; then opts+=(-J "$JUMP"); fi
+  if ((MULTI)); then
+    # No interactive prompts from parallel jobs; keep ssh errors per host.
+    opts+=(-o BatchMode=yes)
+    err_dest=$errlog
+  fi
+
+  # Confirm SSH access (and open the shared connection) before anything else.
+  # User -o options come first on the command line, so they take precedence.
+  if ! ssh "${opts[@]}" "$target" true </dev/null >/dev/null 2>>"$err_dest"; then
+    fail_host "$idx" "$target" "Cannot connect over SSH$(last_error "$errlog")"
+    return 1
+  fi
+
+  if ((NO_SUDO)); then
+    state=disabled
+  else
+    ssh "${opts[@]}" "$target" 'sudo -n true' </dev/null >/dev/null 2>&1
+    sudo_rc=$?
+    case $sudo_rc in
+    0) state=nopasswd ;;
+    127) state=missing ;;
+    255)
+      fail_host "$idx" "$target" 'Lost SSH connection'
+      return 1
+      ;;
+    *)
+      if [[ -n $SHARED_SUDO_PW ]]; then
+        pw=$SHARED_SUDO_PW
+      elif ((!MULTI && !ASK_SUDO_PASS)); then
+        prompt_password 'Sudo password (press Enter to skip): '
+        pw=$PROMPTED_PW
+        PROMPTED_PW=''
+      fi
+      if [[ -n $pw ]]; then
+        # Password is sent over SSH stdin, never placed in argv or environment.
+        if printf '%s\n' "$pw" | ssh "${opts[@]}" "$target" 'sudo -S -p "" -v' >/dev/null 2>&1; then
+          state=password
+        else
+          state=rejected
+          pw=''
+        fi
+      fi
+      ;;
+    esac
+  fi
+
+  # $state is a fixed token, intentionally expanded locally. "env" keeps the
+  # command working with any remote login shell.
+  # shellcheck disable=SC2029
+  {
+    printf '%s\n' 'IFS= read -r SUDO_PW || SUDO_PW='
+    printf '%s\n' "$pw"
+    collector_script
+  } | ssh "${opts[@]}" "$target" "env REMOTE_SUDO_STATE=$state bash -s" >"$rec" 2>>"$err_dest"
+  rc=$?
+  pw=''
+
+  if ((rc != 0)); then
+    if ((rc == 127)); then
+      fail_host "$idx" "$target" 'Remote collector failed (exit 127); is bash installed?'
+    else
+      fail_host "$idx" "$target" "Remote collector failed (exit $rc)$(last_error "$errlog")"
+    fi
+    return 1
+  fi
+  if ! grep -q $'^S\t' "$rec"; then
+    fail_host "$idx" "$target" 'Remote collector returned no data'
+    return 1
+  fi
+
+  # Drop invalid UTF-8 sequences (e.g. odd process names) so JSON stays valid.
+  if command -v iconv >/dev/null 2>&1; then
+    if iconv -f UTF-8 -t UTF-8 -c <"$rec" >"$rec.utf8" 2>/dev/null || [[ -s $rec.utf8 ]]; then
+      [[ -s $rec.utf8 ]] && mv -f -- "$rec.utf8" "$rec"
+    fi
+  fi
+
+  : >"$CTL_DIR/$idx.ok"
+  if ((MULTI)); then progress "[done] $target"; fi
+  return 0
+}
+
+# File name for a target's report in --out DIR.
+report_file_name() {
+  local name=${1//[^A-Za-z0-9._@-]/_}
+  if ((JSON)); then printf '%s.json' "$name"; else printf '%s.txt' "$name"; fi
+}
+
+# Print reports (and the multi-host summary), write --out files and return
+# the exit status: 1 if any host failed, 3 for --fail-on findings, else 0.
+output_results() {
+  local i target rec w r total_w=0 total_r=0 failed=0 first=1 err
+  local summary="" failed_json=""
+
+  if ((JSON && MULTI)); then
+    printf '{\n  "tool": "remotecheck",\n  "version": %s,\n  "hosts": [' "$(json_str "$VERSION")"
+  fi
+
+  for i in "${!TARGETS[@]}"; do
+    target=${TARGETS[i]}
+    rec=$CTL_DIR/$i.rec
+    if [[ -e $CTL_DIR/$i.ok ]]; then
+      read -r w r < <(count_findings "$rec")
+      total_w=$((total_w + w))
+      total_r=$((total_r + r))
+      summary+=$(printf 'R\t%s\tok\t%s\t%s' "$target" "$w" "$r")$'\n'
+
+      if [[ -n $OUT_DIR ]]; then
+        render_report "$target" "$JSON" 0 <"$rec" >"$OUT_DIR/$(report_file_name "$target")"
+      fi
+
+      if ((JSON && MULTI)); then
+        ((first)) || printf ','
+        printf '\n'
+        printf '%s' "$(render_report "$target" 1 0 <"$rec" | sed 's/^/    /')"
+      else
+        if ((!first)); then printf '\n\n'; fi
+        render_report "$target" "$JSON" "$COLOR_OUTPUT" <"$rec"
+      fi
+      first=0
+    else
+      failed=$((failed + 1))
+      err=$(cat "$CTL_DIR/$i.fail" 2>/dev/null)
+      err=${err:-scan did not complete}
+      summary+=$(printf 'R\t%s\tFAILED\t-\t-\t%s' "$target" "${err//$'\t'/ }")$'\n'
+      failed_json+="${failed_json:+,}"$'\n'"    {\"target\": $(json_str "$target"), \"error\": $(json_str "$err")}"
+    fi
+  done
+
+  if ((MULTI)); then
+    if ((JSON)); then
+      printf '%s],\n' "$( ((first)) || printf '\n  ')"
+      printf '  "failed": [%s%s],\n' "$failed_json" "${failed_json:+$'\n  '}"
+      printf '  "findings": {"warning": %d, "review": %d}\n}\n' "$total_w" "$total_r"
+    else
+      printf '\n\n'
+      {
+        printf 'S\thosts\tHost summary (%d host(s), %d failed)\ttable\ttarget=TARGET\tresult=RESULT\twarnings=WARNINGS\treviews=REVIEWS\terror=ERROR\n' \
+          "${#TARGETS[@]}" "$failed"
+        printf '%s' "$summary"
+      } | render_report '' 0 "$COLOR_OUTPUT"
+    fi
+  fi
+
+  ((failed == 0)) || return 1
+  case $FAIL_ON in
+  warning) ((total_w == 0)) || return 3 ;;
+  review) ((total_w + total_r == 0)) || return 3 ;;
+  esac
+  return 0
+}
+
+main() {
+  local f i
+
+  parse_args "$@"
+  for f in "${HOSTS_FILES[@]}"; do read_hosts_file "$f"; done
+  ((${#TARGETS[@]})) || {
+    usage >&2
+    exit 2
+  }
+  normalize_targets
+  ((${#TARGETS[@]} > 1)) && MULTI=1
+  if ((NO_SUDO && ASK_SUDO_PASS)); then usage_error '--no-sudo and --ask-sudo-pass cannot be combined'; fi
+
+  command -v ssh >/dev/null 2>&1 || die 'ssh is required'
+  command -v awk >/dev/null 2>&1 || die 'awk is required'
+
+  if [[ -n $OUT_DIR ]]; then
+    mkdir -p -- "$OUT_DIR" 2>/dev/null && [[ -w $OUT_DIR ]] || die "Cannot write to output directory: $OUT_DIR"
+  fi
+
+  CTL_DIR=$(mktemp -d "${TMPDIR:-/tmp}/remotecheck.XXXXXX") || die 'Cannot create a temporary directory'
+  trap cleanup EXIT
+  trap 'on_signal 130' INT
+  trap 'on_signal 143' TERM
+
+  if [[ $JSON != 1 && -t 1 && -z ${NO_COLOR:-} ]]; then COLOR_OUTPUT=1; fi
+
+  if ((ASK_SUDO_PASS)); then
+    if prompt_password 'Sudo password for all hosts (press Enter to skip): '; then
+      SHARED_SUDO_PW=$PROMPTED_PW
+      PROMPTED_PW=''
+    else
+      printf 'remotecheck: no terminal available; continuing without a sudo password\n' >&2
+    fi
+  fi
+
+  if ((MULTI)); then
+    progress "Scanning ${#TARGETS[@]} hosts, up to $JOBS in parallel..."
+    for i in "${!TARGETS[@]}"; do
+      while (($(jobs -pr | wc -l) >= JOBS)); do sleep 0.2; done
+      scan_host "$i" "${TARGETS[i]}" &
+    done
+    wait
+  else
+    scan_host 0 "${TARGETS[0]}" || die "${TARGETS[0]}: $(cat "$CTL_DIR/0.fail")"
+  fi
+  SHARED_SUDO_PW=''
+
+  output_results
+  exit $?
+}
+
+# Run only when executed, so tests can source this file for its functions.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
