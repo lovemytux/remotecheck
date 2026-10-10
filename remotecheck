@@ -1284,7 +1284,9 @@ main() {
   command -v awk >/dev/null 2>&1 || die 'awk is required'
 
   if [[ -n $OUT_DIR ]]; then
-    mkdir -p -- "$OUT_DIR" 2>/dev/null && [[ -w $OUT_DIR ]] || die "Cannot write to output directory: $OUT_DIR"
+    if ! mkdir -p -- "$OUT_DIR" 2>/dev/null || [[ ! -w $OUT_DIR ]]; then
+      die "Cannot write to output directory: $OUT_DIR"
+    fi
   fi
 
   CTL_DIR=$(mktemp -d "${TMPDIR:-/tmp}/remotecheck.XXXXXX") || die 'Cannot create a temporary directory'
