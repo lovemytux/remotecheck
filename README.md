@@ -2,15 +2,16 @@
 
 **remotecheck** is an open-source Bash utility for remotely collecting Linux host inventory and performing a set of basic security checks over SSH, on one host or many.
 
-It is designed to provide a quick, readable snapshot of a server while continuing to collect information when sudo is unavailable.
+By default it runs a fast, sudo-free **quick scan** that answers "what is this server and what does it serve?". `--full` adds health and security checks, and `--security` adds exposed-service and container checks.
 
 ## Features
 
 - Connects to remote Linux hosts over SSH, reusing a single shared connection per host.
 - Scans one host or many, in parallel, from the command line or a hosts file, with a summary table at the end.
-- Collects host identity, OS and kernel information, uptime, memory, swap, load and disk usage, network interfaces, listening sockets, systemd services, failed units, and a process sample.
-- Runs basic security checks: SSH configuration, UID 0 and empty-password accounts, firewall, SELinux/AppArmor, pending reboot, time synchronization, exposed services, SUID/SGID files, world-writable directories, package updates, and automatic updates.
-- Tries passwordless sudo first; if unavailable, offers a hidden password prompt. Press **Enter** to continue without sudo, or pass `--no-sudo` to skip sudo entirely.
+- **Quick scan (default, no sudo):** host identity, platform (bare metal, VM or container, cloud provider), OS, network addresses, gateway and DNS, the services the host offers and who can reach them, detected server roles (web server, database, container host, Kubernetes node…), recent logins, and the busiest processes.
+- **Full scan (`--full`):** adds memory, swap, load and disk usage, network interfaces, listening sockets, systemd services, failed units, and basic security checks: SSH configuration, UID 0 and empty-password accounts, firewall, SELinux/AppArmor, pending reboot, time synchronization, SUID/SGID files, world-writable directories, package updates, and automatic updates.
+- **Security checks (`--security`):** risky services reachable from the network (Redis, MongoDB, Docker API, telnet…), NFS and SNMP configuration, and Docker/Podman checks: privileged containers, mounted runtime sockets, sensitive host mounts, added capabilities, root containers, ports published past the firewall, and old images.
+- Uses sudo only for `--full` and `--security`: passwordless sudo first, then a hidden password prompt (press **Enter** to skip), or `--no-sudo` to skip sudo entirely.
 - Produces a colored, bordered terminal report, or structured JSON for scripting and automation.
 - Optional exit status based on findings (`--fail-on`) for CI and monitoring.
 - Supports custom ports, identity files, jump hosts, and extra SSH options.
@@ -49,6 +50,9 @@ remotecheck [options] -f HOSTS_FILE
 
 | Option | Description |
 | --- | --- |
+| `--quick` | Inventory: what the server is and what it serves; never uses sudo (default) |
+| `--full` | Inventory plus health and security checks; uses sudo |
+| `--security` | Add exposed-service and container checks; uses sudo. Combine with `--quick` or `--full`. |
 | `--json` | Output structured JSON |
 | `--out DIR` | Also write one report file per host into `DIR` |
 | `--fail-on LEVEL` | Exit with status 3 if any finding is at `LEVEL` or worse (`review` or `warning`) |
@@ -57,16 +61,22 @@ remotecheck [options] -f HOSTS_FILE
 | `-J JUMP` | Jump host(s), passed to `ssh -J` |
 | `-o OPTION` | Extra ssh option as `Key=Value` (repeatable) |
 | `--no-sudo` | Do not try sudo and never prompt for a password |
-| `--ask-sudo-pass` | Prompt once for a sudo password before scanning and use it where passwordless sudo is unavailable |
+| `--ask-sudo-pass` | Prompt once for a sudo password before scanning and use it where passwordless sudo is unavailable (needs `--full` or `--security`) |
 | `-f FILE` | Read targets from a file (repeatable) |
 | `-j N` | Hosts scanned in parallel, 1–64 (default: 5) |
 | `-h`, `--help` | Show help |
 | `-V`, `--version` | Show version |
 
-Basic scan:
+Quick scan (the default): what is this server and what does it serve?
 
 ```bash
 ./remotecheck user@server
+```
+
+Full scan, plus exposed-service and container checks:
+
+```bash
+./remotecheck --full --security user@server
 ```
 
 Custom port and identity file:
@@ -81,17 +91,32 @@ Through a jump host, with an extra SSH option:
 ./remotecheck -J bastion.example.com -o ConnectTimeout=5 user@10.0.0.12
 ```
 
-Non-interactive JSON scan for scripts or cron (no sudo prompt):
+Non-interactive full JSON scan for scripts or cron (no sudo prompt):
 
 ```bash
-./remotecheck --json --no-sudo user@server
+./remotecheck --full --json --no-sudo user@server
 ```
 
 Fail a CI job or monitoring check when anything rated `WARNING` is found:
 
 ```bash
-./remotecheck --no-sudo --fail-on warning user@server
+./remotecheck --full --security --no-sudo --fail-on warning user@server
 ```
+
+## Scan levels
+
+| | Quick (default) | `--full` | `--security` (add-on) |
+| --- | --- | --- | --- |
+| Purpose | What is this server, what does it serve? | Health and security baseline | Exposure and container risks |
+| Sudo | Never | Tried, then prompt | Tried, then prompt |
+| Typical time | About 1 second | 10–60 seconds (filesystem walk) | A few seconds |
+| Sections | Host, OS, detected roles, services offered, network, logins, processes | Quick sections plus resources, interfaces, sockets, systemd, security, filesystem, packages, temp files | Exposed services, container security, container list |
+
+`--security` works with either level: `--quick --security` (or just `--security`) is a fast exposure check, and `--full --security` runs everything.
+
+**Detected roles** combine three clues: process names (visible to any user), the service names of listening ports, and, for container hosts, the number of running containers. A role found from a process is marked `high` confidence; one found only from an open port is `medium`. Ports that only listen on localhost are ignored, so a local DNS stub such as systemd-resolved does not make the host a "DNS server".
+
+**Services offered** groups listening sockets by port and shows each one's widest exposure: `all interfaces`, `public address`, `private network` (RFC 1918, CGNAT, link-local and IPv6 ULA ranges), or `localhost only`. Without sudo, process names are shown only for the scanning user's own processes.
 
 ### SSH configuration
 
@@ -131,8 +156,36 @@ In multi-host mode:
 
 Excerpt from a terminal run (colors removed):
 
+Quick scan:
+
 ```text
-remotecheck report: web1
+remotecheck report: web1 (quick scan)
+
+Detected roles
++-----------------+------------+------------------------------------------------------+
+| ROLE            | CONFIDENCE | EVIDENCE                                             |
++-----------------+------------+------------------------------------------------------+
+| Web server      | high       | process: nginx; port: tcp/443                        |
+| Database: Redis | high       | process: redis-server; port: tcp/6379                |
+| Container host  | high       | process: dockerd, containerd; 2 running container(s) |
++-----------------+------------+------------------------------------------------------+
+
+Services offered
++-----------------------+----------+----------------+--------------+
+| SERVICE               | PORT     | EXPOSURE       | PROCESS      |
++-----------------------+----------+----------------+--------------+
+| SSH                   | tcp/22   | all interfaces | sshd         |
+| HTTPS                 | tcp/443  | all interfaces | nginx        |
+| Redis                 | tcp/6379 | all interfaces | redis-server |
+| Docker published port | tcp/8081 | all interfaces | docker-proxy |
+| PostgreSQL            | tcp/5432 | localhost only | postgres     |
++-----------------------+----------+----------------+--------------+
+```
+
+Full scan with security checks (excerpt):
+
+```text
+remotecheck report: web1 (full scan + security checks)
 
 System resources
 +--------------+---------+------------------------------------------+
@@ -160,7 +213,18 @@ Basic security checks
 | Services on all interfaces   | INFO         | 2: tcp/22, tcp/443                             |
 +------------------------------+--------------+------------------------------------------------+
 
-Findings: 0 warning(s), 3 review item(s)
+Container security
++-----------------------------------+---------+--------------------------------------------------------------+
+| CHECK                             | STATUS  | DETAIL                                                       |
++-----------------------------------+---------+--------------------------------------------------------------+
+| Container runtime                 | INFO    | docker 27.3.1: 2 running, 2 total                            |
+| Docker API over TCP               | PASS    | not enabled (local socket only)                              |
+| Privileged containers             | WARNING | metrics-agent                                                |
+| Runtime socket mounted            | WARNING | metrics-agent                                                |
+| Ports published on all interfaces | REVIEW  | 1 container(s): app 0.0.0.0:8081->80/tcp (Docker-publishe... |
++-----------------------------------+---------+--------------------------------------------------------------+
+
+Findings: 3 warning(s), 4 review item(s)
 ```
 
 Values longer than a column are shortened and end with `...`. The JSON output always contains the full values.
@@ -176,6 +240,8 @@ Each check reports one of these statuses:
 | `REVIEW` | Worth a look; may be intended |
 | `WARNING` | Likely a problem |
 | `INCONCLUSIVE` | Could not be determined (missing tool, missing privileges) |
+
+Quick scan sections (`host`, `os`, `roles`, `services_offered`, `network`, `users`, `processes`) are inventory and carry no statuses.
 
 | Section | Check | Notes |
 | --- | --- | --- |
@@ -196,12 +262,25 @@ Each check reports one of these statuses:
 | Package updates | Pending updates | `apt-get -s dist-upgrade` (simulation, no root needed; packages held with `apt-mark hold` are excluded), or `dnf`/`yum check-update` using cached metadata only. Results reflect the last metadata refresh, so the age of the apt package lists is shown. |
 | | Automatic updates | unattended-upgrades on Debian/Ubuntu; dnf-automatic or yum-cron on RHEL-family systems |
 | World-writable temporary files | World-writable files | Regular files in `/tmp` and `/var/tmp` writable by everyone |
+| Exposed services (`--security`) | Risky network services | Services listening on all interfaces or a public address that are risky to expose: plaintext protocols (telnet, FTP, rsh, TFTP, POP3/IMAP), data stores often run without authentication (Redis, memcached, MongoDB, Elasticsearch, ZooKeeper: `WARNING`), databases and brokers (`REVIEW`), Docker API without TLS and etcd (`WARNING`), kubelet, RDP, VNC, X11, NFS, SMB, rpcbind and monitoring endpoints |
+| | NFS exports | `no_root_squash` (`WARNING`) or exports to any host (`REVIEW`) in `/etc/exports` |
+| | SNMP communities | Default `public`/`private` communities in `snmpd.conf` (usually needs sudo to read) |
+| Container security (`--security`) | Container runtime | Docker or Podman version and container counts; root's containers are inspected when sudo works |
+| | Docker API over TCP | `WARNING` when the daemon listens on TCP without `--tlsverify` |
+| | docker group members | Members have root-equivalent access |
+| | Docker socket permissions | `WARNING` when the socket is world-writable |
+| | Privileged containers, runtime socket mounted | `WARNING`: either one gives a container control of the host |
+| | Sensitive host paths mounted | `/`, `/etc`, `/root`, `/proc`, `/sys`, `/dev`, `/var/lib/docker`, SSH keys and similar |
+| | Host network or PID namespace, added dangerous capabilities | `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYS_MODULE` and similar; `ALL` is a `WARNING` |
+| | Containers running as root | No user set, or user root/0 |
+| | Ports published on all interfaces | Docker-published ports bypass ufw/firewalld input rules, so a host firewall does not protect them |
+| | Images older than 90 days | Likely missing security updates |
 
 The filesystem permission checks walk local filesystems (`/`, `/home`, `/opt`, `/srv`, `/var`, `/tmp`, `/usr/local`, without crossing mount points, skipping container storage) once, with a 60-second limit. On very large trees the result is marked as partial. Without sudo, directories the user cannot read are skipped.
 
 ## Sudo behavior
 
-`remotecheck` first checks whether passwordless sudo works on each host.
+Quick scans never use sudo and never prompt. With `--full` or `--security`, `remotecheck` first checks whether passwordless sudo works on each host.
 
 - If passwordless sudo works, the scan uses it for supported privileged checks.
 - Single host: otherwise, the script prompts for a sudo password without echoing it (only when a terminal is available). Press **Enter** to skip sudo and continue with unprivileged checks.
@@ -226,9 +305,10 @@ With `--json` and a single host, the script prints one JSON object:
 ```json
 {
   "tool": "remotecheck",
-  "version": "1.4.0",
+  "version": "2.0.0",
   "target": "user@server",
   "sudo": {"state": "nopasswd", "privileged": true},
+  "scan": {"level": "full", "security": false},
   "findings": {"warning": 0, "review": 3},
   "sections": [
     {
@@ -255,8 +335,9 @@ With `--json` and a single host, the script prints one JSON object:
 
 - Property sections (`host`, `os`, `summary`) have a `data` object.
 - Table sections have `columns` and `rows`. When a section has no data (for example, a missing utility), it has an empty `rows` array and a `message` explaining why.
-- Section IDs: `host`, `os`, `resources`, `network_interfaces`, `listening_sockets`, `running_services`, `failed_units`, `processes`, `security_checks`, `filesystem_checks`, `package_updates`, `temp_files`, `summary`.
-- `sudo.state` is one of `nopasswd`, `password`, `rejected`, `skipped`, `disabled`, `missing`, or `failed`.
+- `scan.level` is `quick` or `full`; `scan.security` is `true` with `--security`.
+- Section IDs, in order: `host`, `os`, `roles`, `services_offered`, `network`, `users`, then with `--full` `resources`, `network_interfaces`, `listening_sockets`, `running_services`, `failed_units`, then `processes`, then with `--full` `security_checks`, `filesystem_checks`, `package_updates`, `temp_files`, then with `--security` `exposed_services`, `containers`, `container_list`, and finally `summary`.
+- `sudo.state` is one of `unused` (quick scan), `nopasswd`, `password`, `rejected`, `skipped`, `disabled`, `missing`, or `failed`.
 - `findings` counts `WARNING` and `REVIEW` statuses across all sections.
 
 With several hosts, the output is one object containing every host report, the hosts that failed, and the combined finding counts:
@@ -264,7 +345,7 @@ With several hosts, the output is one object containing every host report, the h
 ```json
 {
   "tool": "remotecheck",
-  "version": "1.4.0",
+  "version": "2.0.0",
   "hosts": [
     {"tool": "remotecheck", "target": "web1", "findings": {"warning": 0, "review": 3}, "sections": []}
   ],
@@ -278,7 +359,7 @@ With several hosts, the output is one object containing every host report, the h
 Example: list every check that needs attention on a single host.
 
 ```bash
-./remotecheck --json --no-sudo user@server |
+./remotecheck --json --full --security --no-sudo user@server |
   jq -r '.sections[].rows[]? | select(.status == "REVIEW" or .status == "WARNING") | "\(.status): \(.check) - \(.detail)"'
 ```
 
@@ -290,7 +371,7 @@ Example: warning counts per host from a multi-host scan.
 
 `jq` is optional; `remotecheck` does not require it.
 
-> **Note:** the JSON format changed in version 1.3.0. Earlier versions emitted `sudo_available` and a `report` array of text lines. Version 1.4.0 adds sections and the `findings` object without removing anything.
+> **Upgrading to 2.0:** running without options now does a quick scan (inventory only, no sudo). Add `--full` to get the 1.x report. In JSON, the `scan` object and the `roles`, `services_offered`, `network`, `users`, `exposed_services`, `containers` and `container_list` sections are new, and the socket table's `scope` column now says `private` or `public` instead of `specific`. Version 1.3.0 replaced the older `sudo_available`/`report` format.
 
 ## Color
 
@@ -349,11 +430,13 @@ Integration tests scan a real host over SSH. They run only when `RC_TEST_TARGET`
 RC_TEST_TARGET=user@localhost RC_TEST_ARGS="-p 2222 -i ~/.ssh/test_key" bats test/
 ```
 
+To also check the container findings, start a privileged container on the target and pass its name in `RC_TEST_CONTAINER`.
+
 The script can be sourced without running (`source remotecheck`), which is how the tests reach its functions.
 
 ### Continuous integration
 
-`.github/workflows/ci.yml` runs on every push and pull request. It lints the script and the collector with ShellCheck, starts an SSH server on the runner, and runs the full Bats suite, integration tests included, against `localhost`.
+`.github/workflows/ci.yml` runs on every push and pull request. It lints the script and the collector with ShellCheck, starts an SSH server and a deliberately risky container (privileged, port published on all interfaces) on the runner, and runs the full Bats suite, integration tests included, against `localhost`.
 
 ## Contributing
 
