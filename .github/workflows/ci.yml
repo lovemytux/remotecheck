@@ -51,8 +51,13 @@ jobs:
           sudo systemctl start ssh || sudo service ssh start
           for i in 1 2 3 4 5; do ssh-keyscan -H localhost >> ~/.ssh/known_hosts 2>/dev/null && break; sleep 1; done
 
+      - name: Start a deliberately risky container
+        # Exercises the container checks: privileged, published on all interfaces.
+        run: docker run -d --name rc-test-risky --privileged -p 8081:80 busybox:1.36 sleep 3600
+
       - name: Run tests
         run: |
           RC_TEST_TARGET="$(whoami)@localhost" \
           RC_TEST_ARGS="-i $HOME/.ssh/rc_test" \
+          RC_TEST_CONTAINER=rc-test-risky \
             bats --print-output-on-failure test/

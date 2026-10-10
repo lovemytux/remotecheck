@@ -8,7 +8,8 @@
 #
 # Uses SSH and standard remote Linux utilities to collect host, OS, network,
 # service, process, resource, and basic security information from one or more
-# hosts. Supports optional sudo and JSON output. Intended for authorized
+# hosts at two scan levels (quick inventory, full) with optional security
+# checks. Supports optional sudo and JSON output. Intended for authorized
 # systems only.
 #
 # Design: a collector script runs on each remote host and prints tab-separated
@@ -17,8 +18,12 @@
 
 set -o pipefail
 
-VERSION='1.4.0'
+VERSION='2.0.0'
 JSON=0
+LEVEL=quick
+LEVEL_SET=''
+SECURITY=0
+WANT_SUDO=0
 PORT=''
 IDENTITY=''
 JUMP=''
@@ -45,6 +50,13 @@ Usage:
   remotecheck [options] user@server [user@server ...]
   remotecheck [options] -f HOSTS_FILE
 
+Scan:
+  --quick            Inventory: what the server is and what it serves.
+                     Never uses sudo. This is the default.
+  --full             Inventory plus health and security checks (uses sudo)
+  --security         Add exposed-service and container checks (uses sudo);
+                     combine with --quick or --full
+
 Output:
   --json             Output structured JSON
   --out DIR          Also write one report file per host into DIR
@@ -60,7 +72,8 @@ SSH:
 Sudo:
   --no-sudo          Do not try sudo and never prompt for a password
   --ask-sudo-pass    Prompt once for a sudo password before scanning and use
-                     it where passwordless sudo is unavailable
+                     it where passwordless sudo is unavailable (needs --full
+                     or --security)
 
 Multiple hosts:
   -f FILE            Read targets from FILE (one per line, # starts a comment)
@@ -71,10 +84,11 @@ Other:
   -V, --version      Show version
 
 Sudo behavior:
-  Single host: tries passwordless sudo first; if unavailable, prompts for a
-  password (press Enter to skip). Multiple hosts: never prompts per host; use
-  --ask-sudo-pass to supply one password up front. Multi-host scans use SSH
-  BatchMode, so key or agent authentication is required.
+  Quick scans never use sudo. With --full or --security, passwordless sudo is
+  tried first; on a single host you are then prompted for a password (press
+  Enter to skip). Multiple hosts: never prompts per host; use --ask-sudo-pass
+  to supply one password up front. Multi-host scans use SSH BatchMode, so key
+  or agent authentication is required.
 
 Environment:
   NO_COLOR           Disable colored output when set
@@ -126,6 +140,18 @@ parse_args() {
     case "$1" in
     --json)
       JSON=1
+      shift
+      ;;
+    --quick | --full)
+      if [[ -n $LEVEL_SET && $LEVEL_SET != "${1#--}" ]]; then
+        usage_error '--quick and --full cannot be combined'
+      fi
+      LEVEL=${1#--}
+      LEVEL_SET=$LEVEL
+      shift
+      ;;
+    --security)
+      SECURITY=1
       shift
       ;;
     --no-sudo)
@@ -293,15 +319,23 @@ export LC_ALL=C
 
 SUDO_STATE=${REMOTE_SUDO_STATE:-skipped}
 case $SUDO_STATE in
-    disabled | nopasswd | password | rejected | missing | skipped) ;;
+    disabled | unused | nopasswd | password | rejected | missing | skipped) ;;
     *) SUDO_STATE=skipped ;;
 esac
 [[ $SUDO_STATE == password ]] || SUDO_PW=''
+
+# Scan level (quick or full) and the optional security checks.
+LEVEL=${REMOTE_LEVEL:-quick}
+[[ $LEVEL == full ]] || LEVEL=quick
+SECURITY=${REMOTE_SECURITY:-0}
+[[ $SECURITY == 1 ]] || SECURITY=0
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
 TMO=()
 if have timeout; then TMO=(timeout 60); fi
+TMO10=()
+if have timeout; then TMO10=(timeout 10); fi
 
 # Record format (tab-separated), rendered by the local side:
 #   S  id  title  kv                          start a property/value section
@@ -359,6 +393,7 @@ sudo_text() {
         password) printf 'Sudo authenticated with supplied password' ;;
         rejected) printf 'Password rejected; running without sudo' ;;
         disabled) printf 'Disabled with --no-sudo; running without sudo' ;;
+        unused) printf 'Not used (quick scan)' ;;
         missing) printf 'sudo not installed; running without sudo' ;;
         failed) printf 'sudo could not run commands; running without sudo' ;;
         *) printf 'Skipped or unavailable; running without sudo' ;;
@@ -386,15 +421,272 @@ count_lines() {
     awk 'NF {n++} END {print n+0}'
 }
 
-# Classify a listening address as all, loopback or specific.
-addr_scope() {
+# Classify a listening address: all, loopback, private or public.
+addr_class() {
     local a=${1%:*}
     a=${a%%%*}
+    a=${a#[}
+    a=${a%]}
     case $a in
-        '*' | 0.0.0.0 | '[::]' | '::' | '[::]'*) printf 'all' ;;
-        127.* | '[::1]' | '::1') printf 'loopback' ;;
-        *) printf 'specific' ;;
+        '*' | 0.0.0.0 | '::') printf 'all' ;;
+        127.* | ::1) printf 'loopback' ;;
+        10.* | 192.168.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].* | 169.254.* | \
+            100.6[4-9].* | 100.[7-9][0-9].* | 100.1[01][0-9].* | 100.12[0-7].* | \
+            fc* | fd* | fe80:*) printf 'private' ;;
+        *) printf 'public' ;;
     esac
+}
+
+exposure_text() {
+    case $1 in
+        all) printf 'all interfaces' ;;
+        public) printf 'public address' ;;
+        private) printf 'private network' ;;
+        loopback) printf 'localhost only' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# Well-known service name for a protocol and port ("-" when unknown).
+port_service() {
+    case $1/$2 in
+        tcp/21) printf 'FTP' ;;
+        tcp/22) printf 'SSH' ;;
+        tcp/23) printf 'Telnet' ;;
+        tcp/25 | tcp/465 | tcp/587) printf 'SMTP' ;;
+        tcp/53 | udp/53) printf 'DNS' ;;
+        udp/67 | udp/68) printf 'DHCP' ;;
+        udp/69) printf 'TFTP' ;;
+        tcp/79) printf 'Finger' ;;
+        tcp/80 | tcp/8000 | tcp/8080) printf 'HTTP' ;;
+        tcp/88 | udp/88) printf 'Kerberos' ;;
+        tcp/110 | tcp/995) printf 'POP3' ;;
+        tcp/111 | udp/111) printf 'rpcbind' ;;
+        udp/123) printf 'NTP' ;;
+        tcp/139 | tcp/445) printf 'SMB' ;;
+        tcp/143 | tcp/993) printf 'IMAP' ;;
+        udp/161) printf 'SNMP' ;;
+        tcp/389 | tcp/636) printf 'LDAP' ;;
+        tcp/443 | tcp/8443) printf 'HTTPS' ;;
+        udp/443) printf 'HTTP/3 (QUIC)' ;;
+        udp/500 | udp/4500) printf 'IPsec' ;;
+        tcp/512 | tcp/513) printf 'rexec/rlogin' ;;
+        tcp/514) printf 'rsh / syslog' ;;
+        udp/514 | tcp/6514) printf 'Syslog' ;;
+        tcp/631) printf 'IPP (printing)' ;;
+        tcp/873) printf 'rsync' ;;
+        tcp/1194 | udp/1194) printf 'OpenVPN' ;;
+        tcp/1433) printf 'MS SQL Server' ;;
+        tcp/1521) printf 'Oracle DB' ;;
+        tcp/1883 | tcp/8883) printf 'MQTT' ;;
+        tcp/2049 | udp/2049) printf 'NFS' ;;
+        tcp/2181) printf 'ZooKeeper' ;;
+        tcp/2375) printf 'Docker API (no TLS)' ;;
+        tcp/2376) printf 'Docker API (TLS)' ;;
+        tcp/2379 | tcp/2380) printf 'etcd' ;;
+        tcp/3306) printf 'MySQL/MariaDB' ;;
+        tcp/3389) printf 'RDP' ;;
+        tcp/4222) printf 'NATS' ;;
+        tcp/5432) printf 'PostgreSQL' ;;
+        tcp/5601) printf 'Kibana' ;;
+        tcp/5672) printf 'AMQP (RabbitMQ)' ;;
+        tcp/590[0-9]) printf 'VNC' ;;
+        tcp/5984) printf 'CouchDB' ;;
+        tcp/60??) printf 'X11' ;;
+        tcp/6379) printf 'Redis' ;;
+        tcp/6443) printf 'Kubernetes API' ;;
+        tcp/8086) printf 'InfluxDB' ;;
+        tcp/8123) printf 'ClickHouse HTTP' ;;
+        tcp/9042) printf 'Cassandra' ;;
+        tcp/9090) printf 'Prometheus' ;;
+        tcp/9092) printf 'Kafka' ;;
+        tcp/9093) printf 'Alertmanager' ;;
+        tcp/9100) printf 'Node exporter' ;;
+        tcp/9200 | tcp/9300) printf 'Elasticsearch/OpenSearch' ;;
+        tcp/10050 | tcp/10051) printf 'Zabbix' ;;
+        tcp/10250) printf 'kubelet' ;;
+        tcp/10255) printf 'kubelet (read-only)' ;;
+        tcp/11211 | udp/11211) printf 'memcached' ;;
+        tcp/15672) printf 'RabbitMQ admin' ;;
+        tcp/27017) printf 'MongoDB' ;;
+        udp/51820) printf 'WireGuard' ;;
+        *) printf '%s' '-' ;;
+    esac
+}
+
+# Risk of a service being reachable from other machines: prints
+# "STATUS|reason", or returns 1 when the service is not considered risky.
+exposure_risk() {
+    case $1/$2 in
+        tcp/23) printf 'WARNING|Telnet sends credentials in plaintext' ;;
+        tcp/512 | tcp/513 | tcp/514) printf 'WARNING|rsh/rlogin/rexec are plaintext and weakly authenticated' ;;
+        udp/69) printf 'WARNING|TFTP has no authentication' ;;
+        tcp/21) printf 'REVIEW|FTP sends credentials in plaintext unless FTPS is enforced' ;;
+        tcp/79) printf 'REVIEW|Finger discloses user information' ;;
+        tcp/110 | tcp/143) printf 'REVIEW|POP3/IMAP without TLS sends credentials in plaintext' ;;
+        udp/161) printf 'REVIEW|SNMP: avoid default communities, prefer SNMPv3' ;;
+        tcp/111 | udp/111) printf 'REVIEW|rpcbind exposes RPC services' ;;
+        tcp/2049 | udp/2049) printf 'REVIEW|NFS should only be reachable from trusted networks' ;;
+        tcp/139 | tcp/445) printf 'REVIEW|SMB should only be reachable from trusted networks' ;;
+        tcp/2375) printf 'WARNING|Docker API without TLS gives root to anyone who can connect' ;;
+        tcp/2376) printf 'REVIEW|Docker API: confirm TLS client certificates are required' ;;
+        tcp/2379 | tcp/2380) printf 'WARNING|etcd holds cluster secrets; restrict to cluster members' ;;
+        tcp/10250) printf 'REVIEW|kubelet API: confirm anonymous access is disabled' ;;
+        tcp/10255) printf 'WARNING|kubelet read-only port exposes pod details without authentication' ;;
+        tcp/6379) printf 'WARNING|Redis is often deployed without authentication' ;;
+        tcp/11211 | udp/11211) printf 'WARNING|memcached has no authentication by default' ;;
+        tcp/27017) printf 'WARNING|MongoDB: confirm authentication is enabled' ;;
+        tcp/9200 | tcp/9300) printf 'WARNING|Elasticsearch/OpenSearch: confirm security is enabled' ;;
+        tcp/2181) printf 'WARNING|ZooKeeper has no authentication by default' ;;
+        tcp/5984) printf 'REVIEW|CouchDB reachable from the network' ;;
+        tcp/5432) printf 'REVIEW|PostgreSQL reachable from the network; check pg_hba.conf' ;;
+        tcp/3306) printf 'REVIEW|MySQL/MariaDB reachable from the network' ;;
+        tcp/1433 | tcp/1521) printf 'REVIEW|Database reachable from the network' ;;
+        tcp/9042 | tcp/8086 | tcp/8123) printf 'REVIEW|Database reachable from the network' ;;
+        tcp/9092 | tcp/5672 | tcp/4222) printf 'REVIEW|Message broker reachable from the network' ;;
+        tcp/15672 | tcp/5601) printf 'REVIEW|Admin web interface reachable from the network' ;;
+        tcp/3389) printf 'REVIEW|RDP reachable from the network' ;;
+        tcp/590[0-9]) printf 'REVIEW|VNC is often weakly protected' ;;
+        tcp/60??) printf 'WARNING|X11 server accepts network connections' ;;
+        tcp/9090 | tcp/9093 | tcp/9100) printf 'REVIEW|Monitoring endpoint exposes internal details' ;;
+        *) return 1 ;;
+    esac
+}
+
+# Role rules: "Role;;process regex;;ports". The regex is matched against
+# "comm args" for every process; ports count only when reachable from other
+# machines. A process match gives high confidence, a port match medium.
+ROLE_RULES=$(cat <<'RULES'
+Web server;;^(nginx|apache2|httpd|caddy|lighttpd|openresty) ;;tcp/80 tcp/443 tcp/8080 tcp/8443 udp/443
+Reverse proxy / load balancer;;^(haproxy|traefik|envoy|varnishd) ;;
+Database: PostgreSQL;;^(postgres|postmaster) ;;tcp/5432
+Database: MySQL/MariaDB;;^(mysqld|mariadbd) ;;tcp/3306
+Database: MongoDB;;^mongod ;;tcp/27017
+Database: Redis;;^(redis-server|valkey-server|keydb-server) ;;tcp/6379
+Database: Microsoft SQL Server;;^sqlservr ;;tcp/1433
+Database: ClickHouse;;^clickhouse;;tcp/8123
+Database: Cassandra;;org\.apache\.cassandra;;tcp/9042
+Database: InfluxDB;;^influxd ;;tcp/8086
+Cache: memcached;;^memcached ;;tcp/11211 udp/11211
+Search: Elasticsearch/OpenSearch;;org\.(elasticsearch|opensearch);;tcp/9200 tcp/9300
+Message broker: RabbitMQ;;rabbit;;tcp/5672 tcp/15672
+Message broker: Kafka;;kafka\.Kafka;;tcp/9092
+Message broker: MQTT;;^mosquitto ;;tcp/1883 tcp/8883
+Message broker: NATS;;^nats-server;;tcp/4222
+Container host;;^(dockerd|containerd|podman|conmon|crio) ;;tcp/2375 tcp/2376
+Kubernetes control plane;;^(kube-apiserver|kube-controller|kube-scheduler|etcd) |k3s server;;tcp/6443 tcp/2379 tcp/2380
+Kubernetes node;;^(kubelet|k3s|k3s-agent|k3s-server) ;;tcp/10250
+Mail server;;/postfix/|^(exim4?|sendmail|dovecot|opensmtpd) ;;tcp/25 tcp/465 tcp/587 tcp/110 tcp/143 tcp/993 tcp/995
+DNS server;;^(named|unbound|dnsmasq|pdns_server|pdns_recursor|coredns|knotd) ;;tcp/53 udp/53
+File server;;^(smbd|vsftpd|proftpd|pure-ftpd|rpc\.mountd) ;;tcp/21 tcp/139 tcp/445 tcp/2049
+Directory / authentication;;^(slapd|ns-slapd|krb5kdc|samba) ;;tcp/88 tcp/389 tcp/636
+VPN gateway;;^(openvpn|charon|tailscaled|zerotier-one) ;;udp/1194 udp/51820 udp/500 udp/4500
+Monitoring;;^(prometheus|node_exporter|grafana|grafana-server|zabbix_server|zabbix_agentd|zabbix_agent2|telegraf|netdata|alertmanager) ;;tcp/9090 tcp/9093 tcp/9100 tcp/10050 tcp/10051
+CI/CD;;jenkins\.war|Runner\.Listener|gitlab-runner|gitlab-workhorse|^(drone|woodpecker|buildkite-agent) ;;
+Virtualization host;;^(libvirtd|virtqemud|qemu-system[^ ]*|VBoxHeadless) ;;
+Remote desktop;;^(xrdp|Xvnc|x11vnc) ;;tcp/3389 tcp/5900 tcp/5901
+Log collector;;org\.logstash|^(graylog|loki|fluentd|fluent-bit|vector|syslog-ng) ;;udp/514 tcp/6514
+Application runtime;;^(php-fpm[0-9.]*|gunicorn|uwsgi|puma|unicorn|node|java|dotnet) ;;
+RULES
+)
+
+# detect_roles PROCESS_LINES PORTS
+# Prints "role<TAB>confidence<TAB>evidence" for each matching rule.
+detect_roles() {
+    awk -F';;' -v ports=" $2 " '
+        FNR == NR { procs[++np] = $0; next }
+        NF < 3 { next }
+        {
+            role = $1; re = $2; pm = ""; pp = ""; cnt = 0
+            if (re != "") for (i = 1; i <= np; i++) if (procs[i] ~ re) {
+                split(procs[i], w, " "); nm = w[1]
+                if (!((role, nm) in seen)) { seen[role, nm] = 1; if (cnt < 4) pm = pm (pm != "" ? ", " : "") nm; cnt++ }
+            }
+            if (cnt > 4) pm = pm ", ..."
+            m = split($3, rp, " ")
+            for (i = 1; i <= m; i++) if (index(ports, " " rp[i] " ")) pp = pp (pp != "" ? ", " : "") rp[i]
+            if (pm != "" || pp != "") {
+                ev = (pm != "") ? "process: " pm : ""
+                if (pp != "") ev = ev (ev != "" ? "; " : "") "port: " pp
+                print role "\t" ((pm != "") ? "high" : "medium") "\t" ev
+            }
+        }
+    ' <(printf '%s\n' "$1") <(printf '%s\n' "$ROLE_RULES")
+}
+
+dmi() {
+    local f=/sys/class/dmi/id/$1 v=''
+    [[ -r $f ]] && read -r v <"$f" 2>/dev/null
+    case $v in
+        'To be filled by O.E.M.' | 'Default string' | 'System Product Name' | 'Not Specified' | None) v='' ;;
+    esac
+    printf '%s' "$v"
+}
+
+detect_platform() {
+    local v='' c=''
+    if have systemd-detect-virt; then
+        c=$(systemd-detect-virt -c 2>/dev/null)
+        v=$(systemd-detect-virt -v 2>/dev/null)
+        [[ $c == none ]] && c=''
+        if [[ -n $c && -n $v && $v != none ]]; then printf '%s (container) on %s (virtual machine)' "$c" "$v"; return; fi
+        if [[ -n $c ]]; then printf '%s (container)' "$c"; return; fi
+        if [[ -n $v && $v != none ]]; then printf '%s (virtual machine)' "$v"; return; fi
+    fi
+    if [[ -e /.dockerenv ]]; then printf 'docker (container)'; return; fi
+    if [[ -e /run/.containerenv ]]; then printf 'podman (container)'; return; fi
+    if grep -qE 'docker|kubepods|containerd|lxc' /proc/1/cgroup 2>/dev/null; then printf 'container'; return; fi
+    if grep -q '^flags.* hypervisor' /proc/cpuinfo 2>/dev/null; then printf 'virtual machine'; return; fi
+    if [[ $v == none ]]; then printf 'bare metal'; else printf 'bare metal (probably)'; fi
+}
+
+hardware_info() {
+    local vendor product
+    vendor=$(dmi sys_vendor)
+    product=$(dmi product_name)
+    printf '%s' "${vendor}${vendor:+${product:+ }}${product}"
+}
+
+cloud_provider() {
+    local id
+    id="$(dmi sys_vendor)|$(dmi product_name)|$(dmi bios_vendor)|$(dmi board_vendor)|$(dmi chassis_asset_tag)"
+    case $id in
+        *7783-7084-3265-9085-8269-3286-77*) printf 'Microsoft Azure' ;;
+        *Amazon* | *EC2*) printf 'Amazon Web Services' ;;
+        *Google*) printf 'Google Cloud' ;;
+        *DigitalOcean*) printf 'DigitalOcean' ;;
+        *Hetzner*) printf 'Hetzner' ;;
+        *OracleCloud*) printf 'Oracle Cloud' ;;
+        *Alibaba*) printf 'Alibaba Cloud' ;;
+        *Tencent*) printf 'Tencent Cloud' ;;
+        *Linode* | *Akamai*) printf 'Akamai (Linode)' ;;
+        *Vultr*) printf 'Vultr' ;;
+        *Scaleway*) printf 'Scaleway' ;;
+        *OVH*) printf 'OVHcloud' ;;
+        *Exoscale*) printf 'Exoscale' ;;
+        *OpenStack*) printf 'OpenStack' ;;
+    esac
+}
+
+# Number of running containers, when a container runtime is accessible.
+container_count() {
+    local rt out
+    for rt in docker podman; do
+        have "$rt" || continue
+        if ((PRIV)); then
+            out=$(run_priv "${TMO10[@]}" "$rt" ps -q) || continue
+        else
+            out=$(with_timeout 10 "$rt" ps -q 2>/dev/null) || continue
+        fi
+        count_lines <<<"$out"
+        return 0
+    done
+    return 1
+}
+
+# pick_status LIST STATUS: STATUS when LIST is non-empty, else PASS.
+pick_status() {
+    if [[ -n $1 ]]; then printf '%s' "$2"; else printf 'PASS'; fi
 }
 
 # Approximate effective sshd settings from the config files when "sshd -T"
@@ -428,32 +720,467 @@ apt_lists_age() {
     printf '%s day(s) ago (approximate)' "$(((now - stamp) / 86400))"
 }
 
-main() {
-    local PRIV=0 data line count s n rc
-    local iface state addresses proto sock_state local_addr peer_addr process_info scope port exposed=''
-    local unit load active sub description proc_user proc_pid proc_command
+# ---- Data gathered once and shared by several sections ---------------------
 
-    if [[ $SUDO_STATE == nopasswd || $SUDO_STATE == password ]]; then
-        if run_priv true; then
-            PRIV=1
-        else
-            SUDO_STATE=failed
-            SUDO_PW=''
+# Fills SOCK_LINES (one tab-separated entry per listening socket:
+# proto, state, local, peer, class, process info, process name), SERVICES
+# (one line per protocol/port: proto, port, widest exposure, process name;
+# most exposed first), ALL_PORTS and exposed (ports on all interfaces).
+gather_sockets() {
+    local pname cls
+    have ss || return 0
+    SOCK_OK=1
+    # Older ss versions lack -H (no header); fall back to stripping it.
+    data=$(run_priv ss -H -lntup) || data=$(run_priv ss -lntup | awk 'NR > 1')
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        read -r proto sock_state _ _ local_addr peer_addr process_info <<<"$line"
+        cls=$(addr_class "$local_addr")
+        pname='-'
+        if [[ $process_info == users:\(\(\"* ]]; then
+            pname=${process_info#users:((\"}
+            pname=${pname%%\"*}
+        fi
+        SOCK_LINES+=("$proto"$'\t'"$sock_state"$'\t'"$local_addr"$'\t'"$peer_addr"$'\t'"$cls"$'\t'"${process_info:--}"$'\t'"$pname")
+        port="$proto/${local_addr##*:}"
+        [[ " $ALL_PORTS " == *" $port "* ]] || ALL_PORTS="${ALL_PORTS:+$ALL_PORTS }$port"
+        if [[ $cls == all ]]; then
+            [[ " $exposed " == *" $port "* ]] || exposed="${exposed:+$exposed }$port"
+        fi
+    done <<<"$data"
+
+    SERVICES=$(printf '%s\n' "${SOCK_LINES[@]}" | awk -F'\t' '
+        NF < 7 { next }
+        {
+            n = split($3, a, ":"); key = $1 "\t" a[n]
+            r = ($5 == "all") ? 4 : ($5 == "public") ? 3 : ($5 == "private") ? 2 : 1
+            if (!(key in rank)) { order[++k] = key; rank[key] = r; cls[key] = $5; proc[key] = $7 }
+            else {
+                if (r > rank[key]) { rank[key] = r; cls[key] = $5 }
+                if (proc[key] == "-" && $7 != "-") proc[key] = $7
+            }
+        }
+        END { for (i = 1; i <= k; i++) print rank[order[i]] "\t" order[i] "\t" cls[order[i]] "\t" proc[order[i]] }
+    ' | sort -t$'\t' -k1,1nr -k3,3n | cut -f2-)
+}
+
+# Process list as "comm args", without kernel threads.
+gather_processes() {
+    PROCS=$(ps -eo comm=,args= 2>/dev/null | awk '$2 !~ /^\[/')
+}
+
+# ---- Quick scan sections --------------------------------------------------
+
+collect_roles() {
+    local ports='' pt cls pn out role conf ev
+    section_table roles 'Detected roles' 'role=ROLE' 'confidence=CONFIDENCE' 'evidence=EVIDENCE'
+    # Only ports reachable from other machines count as evidence.
+    while IFS=$'\t' read -r proto pt cls pn; do
+        [[ -n $proto && $cls != loopback ]] && ports+=" $proto/$pt"
+    done <<<"$SERVICES"
+    out=$(detect_roles "$PROCS" "$ports")
+    if [[ -z $out ]]; then
+        msg 'No well-known server roles detected'
+        return
+    fi
+    while IFS=$'\t' read -r role conf ev; do
+        if [[ $role == 'Container host' ]] && n=$(container_count); then
+            ev+="; $n running container(s)"
+        fi
+        row "$role" "$conf" "$ev"
+    done <<<"$out"
+}
+
+collect_services_offered() {
+    local pt cls pn svc
+    section_table services_offered 'Services offered' \
+        'service=SERVICE' 'port=PORT' 'exposure=EXPOSURE' 'process=PROCESS'
+    if ((!SOCK_OK)); then
+        msg 'ss command unavailable'
+        return
+    fi
+    if [[ -z $SERVICES ]]; then
+        msg 'No listening sockets found'
+        return
+    fi
+    while IFS=$'\t' read -r proto pt cls pn; do
+        svc=$(port_service "$proto" "$pt")
+        [[ $svc == - && $pn == docker-proxy ]] && svc='Docker published port'
+        [[ $svc == - ]] && svc='unknown'
+        row "$svc" "$proto/$pt" "$(exposure_text "$cls")" "$pn"
+    done <<<"$SERVICES"
+    ((PRIV)) || msg 'Without sudo, process names are shown only for your own processes'
+}
+
+collect_network_summary() {
+    local dns=''
+    section_kv network 'Network'
+    if have ip; then
+        kv addresses 'Addresses' "$(ip -o addr show scope global 2>/dev/null |
+            awk '{ printf "%s%s %s", (n++ ? ", " : ""), $2, $4 } END { if (!n) printf "none" }')"
+        kv gateway 'Default gateway' "$(ip route show default 2>/dev/null | awk '
+            { g = ""; d = ""; for (i = 1; i < NF; i++) { if ($i == "via") g = $(i + 1); if ($i == "dev") d = $(i + 1) }
+              printf "%s%s%s", (n++ ? ", " : ""), (g != "" ? g : "direct"), (d != "" ? " (" d ")" : "") }
+            END { if (!n) printf "none" }')"
+    else
+        kv addresses 'Addresses' 'ip command unavailable'
+    fi
+    if [[ -r /etc/resolv.conf ]]; then
+        dns=$(awk '$1 == "nameserver" { printf "%s%s", (n++ ? ", " : ""), $2 }' /etc/resolv.conf)
+    fi
+    if [[ $dns == 127.0.0.53 && -r /run/systemd/resolve/resolv.conf ]]; then
+        dns="$(awk '$1 == "nameserver" { printf "%s%s", (n++ ? ", " : ""), $2 }' /run/systemd/resolve/resolv.conf) (via systemd-resolved)"
+    fi
+    kv dns 'DNS servers' "${dns:-none configured}"
+}
+
+collect_users() {
+    local had=0 u tty d t rest from
+    section_table users 'Logins' 'user=USER' 'terminal=TERMINAL' 'from=FROM' 'when=WHEN' 'session=SESSION'
+    if have who; then
+        while read -r u tty d t rest; do
+            [[ -n $u ]] || continue
+            from=${rest//[()]/}
+            row "$u" "$tty" "${from:-local}" "$d $t" 'logged in'
+            had=1
+        done <<<"$(who 2>/dev/null)"
+    fi
+    if have last; then
+        while read -r u tty from rest; do
+            case $u in '' | reboot | shutdown | wtmp | wtmpdb) continue ;; esac
+            [[ $rest == *'still logged in'* ]] && continue
+            row "$u" "$tty" "$from" "$rest" 'recent'
+            had=1
+        done <<<"$(with_timeout 5 last -n 5 -i -w 2>/dev/null)"
+    fi
+    ((had)) || msg 'No current or recent logins recorded'
+}
+
+collect_sockets_table() {
+    local entry cls pinfo pname
+    section_table listening_sockets 'Listening TCP/UDP sockets' \
+        'protocol=PROTOCOL' 'state=STATE' 'local_address=LOCAL ADDRESS' \
+        'peer_address=PEER ADDRESS' 'scope=SCOPE' 'service=SERVICE' 'process=PROCESS'
+    if ((!SOCK_OK)); then
+        msg 'ss command unavailable'
+        return
+    fi
+    if ((${#SOCK_LINES[@]} == 0)); then
+        msg 'No listening sockets found'
+        return
+    fi
+    for entry in "${SOCK_LINES[@]}"; do
+        IFS=$'\t' read -r proto sock_state local_addr peer_addr cls pinfo pname <<<"$entry"
+        row "$proto" "$sock_state" "$local_addr" "$peer_addr" "$cls" \
+            "$(port_service "$proto" "${local_addr##*:}")" "$pinfo"
+    done
+}
+
+collect_summary() {
+    local scan_text='Full scan'
+    [[ $LEVEL == quick ]] && scan_text='Quick scan (inventory)'
+    ((SECURITY)) && scan_text+=' + security checks'
+
+    section_kv summary 'Scan summary'
+    kv scan 'Scan' "$scan_text"
+    if [[ $LEVEL == quick ]] && ((!SECURITY)); then
+        kv status 'Scan status' 'Completed'
+        kv coverage 'Coverage' 'Inventory only; use --full for health and security checks, --security for exposure and container checks'
+    elif ((PRIV)); then
+        kv status 'Scan status' 'Completed'
+        kv coverage 'Coverage' 'Privileged checks attempted where implemented'
+    else
+        kv status 'Scan status' 'Completed with limited privileges'
+        kv coverage 'Coverage' 'Checks requiring elevated privileges may be incomplete'
+    fi
+    kv sudo 'Sudo status' "$(sudo_text "$SUDO_STATE")"
+
+    if [[ $LEVEL == quick ]] && ((!SECURITY)); then
+        note 'Quick scan: inventory only, sudo not used.'
+    elif ((PRIV)); then
+        note 'Scan completed with sudo available.'
+    else
+        note 'NOTICE: Sudo was unavailable or skipped.'
+        note 'Accessible checks were completed; some results may be incomplete.'
+    fi
+    note 'This basic scan is not a guarantee that the host is secure.'
+}
+
+# ---- Security sections (--security) ----------------------------------------
+
+collect_exposed_services() {
+    local pt cls pn risk found=0 nrs wild where
+    section_table exposed_services 'Exposed services' 'check=CHECK' 'status=STATUS' 'detail=DETAIL'
+    if ((SOCK_OK)); then
+        while IFS=$'\t' read -r proto pt cls pn; do
+            [[ $cls == all || $cls == public ]] || continue
+            risk=$(exposure_risk "$proto" "$pt") || continue
+            where="on $(exposure_text "$cls")"
+            [[ $pn != - ]] && where+=", process $pn"
+            row "$(port_service "$proto" "$pt") ($proto/$pt)" "${risk%%|*}" "${risk#*|}; $where"
+            found=1
+        done <<<"$SERVICES"
+        ((found)) || row 'Risky network services' 'PASS' 'none on all interfaces or public addresses'
+    else
+        row 'Risky network services' 'INCONCLUSIVE' 'ss command unavailable'
+    fi
+
+    # NFS exports
+    if [[ -r /etc/exports ]]; then
+        data=$(awk '!/^[[:space:]]*(#|$)/' /etc/exports)
+        if [[ -n $data ]]; then
+            nrs=$(awk '/no_root_squash/ {print $1}' <<<"$data" | first_three)
+            wild=$(awk '/[[:space:]]\*([(]|[[:space:]]|$)/ {print $1}' <<<"$data" | first_three)
+            [[ -n $nrs ]] && row 'NFS exports' 'WARNING' "no_root_squash on: $nrs"
+            [[ -n $wild ]] && row 'NFS exports' 'REVIEW' "exported to any host (*): $wild"
+            if [[ -z $nrs && -z $wild ]]; then
+                row 'NFS exports' 'PASS' "$(count_lines <<<"$data") export(s); no no_root_squash or wildcard hosts"
+            fi
         fi
     fi
-    meta sudo_state "$SUDO_STATE"
-    meta privileged "$PRIV"
 
-    # ---- Host -------------------------------------------------------------
+    # SNMP communities (snmpd.conf is usually readable by root only)
+    if [[ -e /etc/snmp/snmpd.conf ]]; then
+        if data=$(run_priv cat /etc/snmp/snmpd.conf); then
+            if grep -qiE '^[[:space:]]*(rocommunity6?|rwcommunity6?|com2sec6?)[[:space:]].*(public|private)' <<<"$data"; then
+                row 'SNMP communities' 'WARNING' 'default community (public/private) configured'
+            elif grep -qiE '^[[:space:]]*rwcommunity' <<<"$data"; then
+                row 'SNMP communities' 'REVIEW' 'read-write community configured'
+            else
+                row 'SNMP communities' 'PASS' 'no default communities'
+            fi
+        else
+            row 'SNMP communities' 'INCONCLUSIVE' 'snmpd.conf not readable (needs sudo)'
+        fi
+    fi
+}
+
+collect_containers() {
+    local rt='' cand ver='' ids='' total=0 running=0 members sockf='' sock_mode dargs dconf='' list_rows=''
+    local insp name image state priv netmode pidmode user caps mounts ports imgid flags m p pub cap age created now
+    local l_priv='' l_sock='' l_mount='' l_ns='' l_caps='' l_root='' l_ports='' l_old='' caps_all=0 n_root=0 n_ports=0
+    local -a rtc=() idarr=() capa=() mnta=() porta=()
+
+    section_table containers 'Container security' 'check=CHECK' 'status=STATUS' 'detail=DETAIL'
+
+    # Prefer root's view (rootful containers) when sudo works.
+    for cand in docker podman; do
+        have "$cand" || continue
+        if ((PRIV)) && run_priv "${TMO10[@]}" "$cand" info >/dev/null; then
+            rt=$cand
+            rtc=(run_priv "$cand")
+            break
+        fi
+        if with_timeout 10 "$cand" info >/dev/null 2>&1; then
+            rt=$cand
+            rtc=("$cand")
+            break
+        fi
+    done
+
+    if [[ -n $rt ]]; then
+        ver=$("${rtc[@]}" version --format '{{.Server.Version}}' 2>/dev/null)
+        [[ -n $ver ]] || ver=$("${rtc[@]}" version --format '{{.Version}}' 2>/dev/null)
+        ids=$("${rtc[@]}" ps -q 2>/dev/null)
+        running=$(count_lines <<<"$ids")
+        total=$("${rtc[@]}" ps -aq 2>/dev/null | count_lines)
+        row 'Container runtime' 'INFO' "$rt ${ver:-(version unknown)}: $running running, $total total"
+    elif have docker && ! grep -q '^dockerd ' <<<"$PROCS"; then
+        row 'Container runtime' 'INFO' 'docker installed, daemon not running'
+    elif have docker || have podman; then
+        row 'Container runtime' 'INCONCLUSIVE' 'docker/podman installed but not accessible (needs sudo or docker group)'
+    elif grep -qE '^(containerd|crio) ' <<<"$PROCS"; then
+        row 'Container runtime' 'INFO' 'containerd/CRI-O running; per-container checks support Docker and Podman'
+    else
+        row 'Container runtime' 'INFO' 'no container runtime detected'
+    fi
+
+    # Docker daemon configuration (readable without access to the daemon).
+    if have docker || grep -q '^dockerd ' <<<"$PROCS"; then
+        dargs=$(awk '$1 == "dockerd"' <<<"$PROCS")
+        [[ -r /etc/docker/daemon.json ]] && dconf=$(cat /etc/docker/daemon.json 2>/dev/null)
+        if grep -qE '(-H|--host)[= ]*tcp://' <<<"$dargs" || grep -q '"tcp://' <<<"$dconf" ||
+            [[ " $ALL_PORTS " == *" tcp/2375 "* ]]; then
+            if grep -q 'tlsverify' <<<"$dargs$dconf"; then
+                row 'Docker API over TCP' 'INFO' 'enabled with TLS verification'
+            else
+                row 'Docker API over TCP' 'WARNING' 'enabled without --tlsverify; anyone who can connect gets root'
+            fi
+        else
+            row 'Docker API over TCP' 'PASS' 'not enabled (local socket only)'
+        fi
+
+        members=$(getent group docker 2>/dev/null | awk -F: '{print $4}')
+        if [[ -n $members ]]; then
+            row 'docker group members' 'REVIEW' "${members//,/, } (root-equivalent access)"
+        else
+            row 'docker group members' 'PASS' 'none'
+        fi
+
+        for sockf in /var/run/docker.sock /run/docker.sock; do
+            [[ -S $sockf ]] && break
+        done
+        if [[ -S $sockf ]]; then
+            sock_mode=$(stat -c '%a %U:%G' "$sockf" 2>/dev/null)
+            if [[ ${sock_mode%% *} =~ [2367]$ ]]; then
+                row 'Docker socket permissions' 'WARNING' "world-writable ($sock_mode)"
+            else
+                row 'Docker socket permissions' 'PASS' "${sock_mode:-unknown}"
+            fi
+        fi
+    fi
+
+    # Per-container checks (running containers, up to 100).
+    if ((running > 0)); then
+        now=$(date +%s)
+        read -r -a idarr <<<"$(head -n 100 <<<"$ids" | tr '\n' ' ')"
+        # Go template, not shell expansion.
+        # shellcheck disable=SC2016
+        insp=$("${rtc[@]}" inspect --format '{{.Name}}|{{.Config.Image}}|{{.State.Status}}|{{.HostConfig.Privileged}}|{{.HostConfig.NetworkMode}}|{{.HostConfig.PidMode}}|{{.Config.User}}|{{range .HostConfig.CapAdd}}{{.}},{{end}}|{{range .Mounts}}{{.Source}},{{end}}|{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}:{{.HostPort}}->{{$p}},{{end}}{{end}}|{{.Image}}' "${idarr[@]}" 2>/dev/null)
+
+        while IFS='|' read -r name image state priv netmode pidmode user caps mounts ports imgid; do
+            [[ -n $name ]] || continue
+            name=${name#/}
+            flags=''
+            if [[ $priv == true ]]; then
+                flags+=' privileged'
+                l_priv+="${l_priv:+, }$name"
+            fi
+            if [[ $netmode == host ]]; then
+                flags+=' host-network'
+                l_ns+="${l_ns:+, }$name (network)"
+            fi
+            if [[ $pidmode == host ]]; then
+                flags+=' host-pid'
+                l_ns+="${l_ns:+, }$name (pid)"
+            fi
+            case $user in
+                '' | root | 0 | 0:* | root:*)
+                    flags+=' root'
+                    n_root=$((n_root + 1))
+                    l_root+="${l_root:+, }$name"
+                    ;;
+            esac
+
+            IFS=, read -r -a capa <<<"$caps"
+            for cap in "${capa[@]}"; do
+                cap=${cap#CAP_}
+                case $cap in
+                    ALL)
+                        caps_all=1
+                        flags+=' cap:ALL'
+                        l_caps+="${l_caps:+, }$name (ALL)"
+                        ;;
+                    SYS_ADMIN | NET_ADMIN | SYS_PTRACE | SYS_MODULE | DAC_READ_SEARCH | SYS_RAWIO | BPF | PERFMON)
+                        flags+=" cap:$cap"
+                        l_caps+="${l_caps:+, }$name ($cap)"
+                        ;;
+                esac
+            done
+
+            IFS=, read -r -a mnta <<<"$mounts"
+            for m in "${mnta[@]}"; do
+                case $m in
+                    /var/run/docker.sock | /run/docker.sock | /run/podman/podman.sock | /var/run/podman/podman.sock)
+                        flags+=' runtime-socket'
+                        l_sock+="${l_sock:+, }$name"
+                        ;;
+                    / | /etc | /root | /boot | /proc | /sys | /dev | /run | /var/run | /home | /var/lib/docker | \
+                        /etc/shadow | /etc/sudoers | /etc/ssh | /root/.ssh)
+                        flags+=" host:$m"
+                        l_mount+="${l_mount:+, }$name ($m)"
+                        ;;
+                esac
+            done
+
+            pub=''
+            IFS=, read -r -a porta <<<"$ports"
+            for p in "${porta[@]}"; do
+                case $p in
+                    :*) pub+="${pub:+ }0.0.0.0$p" ;;
+                    0.0.0.0:*) pub+="${pub:+ }$p" ;;
+                esac
+            done
+            if [[ -n $pub ]]; then
+                flags+=' public-ports'
+                n_ports=$((n_ports + 1))
+                l_ports+="${l_ports:+; }$name $pub"
+            fi
+
+            age=''
+            created=$("${rtc[@]}" image inspect --format '{{.Created}}' "$imgid" 2>/dev/null)
+            if [[ -n $created ]] && created=$(date -d "$created" +%s 2>/dev/null); then
+                age=$(((now - created) / 86400))
+            fi
+            if [[ -n $age ]] && ((age > 90)); then
+                flags+=" image:${age}d"
+                l_old+="${l_old:+, }$name ($age days)"
+            fi
+
+            ports=${ports%,}
+            ports=${ports//,/ }
+            flags=${flags# }
+            list_rows+="$name"$'\t'"$image"$'\t'"$state"$'\t'"${ports:--}"$'\t'"${flags:--}"$'\n'
+        done <<<"$insp"
+
+        row 'Privileged containers' "$(pick_status "$l_priv" WARNING)" "${l_priv:-none}"
+        row 'Runtime socket mounted' "$(pick_status "$l_sock" WARNING)" "${l_sock:-none}"
+        row 'Sensitive host paths mounted' "$(pick_status "$l_mount" REVIEW)" "${l_mount:-none}"
+        row 'Host network or PID namespace' "$(pick_status "$l_ns" REVIEW)" "${l_ns:-none}"
+        if ((caps_all)); then
+            row 'Added dangerous capabilities' 'WARNING' "$l_caps"
+        else
+            row 'Added dangerous capabilities' "$(pick_status "$l_caps" REVIEW)" "${l_caps:-none}"
+        fi
+        if ((n_root > 0)); then
+            row 'Containers running as root' 'REVIEW' "$n_root of $running: $l_root"
+        else
+            row 'Containers running as root' 'PASS' 'none'
+        fi
+        if ((n_ports > 0)); then
+            p="$n_ports container(s): $l_ports"
+            [[ $rt == docker ]] && p+=' (Docker-published ports bypass ufw/firewalld input rules)'
+            row 'Ports published on all interfaces' 'REVIEW' "$p"
+        else
+            row 'Ports published on all interfaces' 'PASS' 'none'
+        fi
+        row 'Images older than 90 days' "$(pick_status "$l_old" REVIEW)" "${l_old:-none}"
+    fi
+
+    section_table container_list 'Containers' 'name=NAME' 'image=IMAGE' 'state=STATE' 'ports=PORTS' 'flags=FLAGS'
+    if [[ -n $list_rows ]]; then
+        while IFS=$'\t' read -r name image state ports flags; do
+            [[ -n $name ]] || continue
+            row "$name" "$image" "$state" "${ports:--}" "${flags:--}"
+        done <<<"$list_rows"
+    elif [[ -n $rt ]]; then
+        msg 'No running containers'
+    else
+        msg 'No accessible container runtime'
+    fi
+}
+
+# ---- Sections shared by both scan levels and full-scan sections ------------
+
+# Host
+collect_host() {
     section_kv host 'Host'
     kv host 'Host' "$(hostname 2>/dev/null || printf unknown)"
     kv fqdn 'FQDN' "$(with_timeout 3 hostname -f 2>/dev/null || printf unavailable)"
+    kv platform 'Platform' "$(detect_platform)"
+    s=$(hardware_info)
+    [[ -n $s ]] && kv hardware 'Hardware' "$s"
+    s=$(cloud_provider)
+    [[ -n $s ]] && kv cloud 'Cloud provider' "$s"
+    kv login_accounts 'Login accounts' "$(awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /(nologin|false)$/ {n++} END {print n+0}' /etc/passwd 2>/dev/null) user account(s) with a login shell, plus root"
     kv user 'Current user' "$(id -un 2>/dev/null || printf unknown)"
     kv id 'User ID / groups' "$(id 2>/dev/null || printf unavailable)"
     kv collected_at 'Collected at' "$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date)"
     kv sudo 'Sudo status' "$(sudo_text "$SUDO_STATE")"
+}
 
-    # ---- Operating system -------------------------------------------------
+# Operating system
+collect_os() {
     section_kv os 'Operating system'
     if [[ -r /etc/os-release ]]; then
         # Sourced in subshells so its variables do not leak into the collector.
@@ -467,8 +1194,10 @@ main() {
     kv kernel 'Kernel' "$(uname -srmo 2>/dev/null || uname -srm 2>/dev/null || printf unknown)"
     kv architecture 'Architecture' "$(uname -m 2>/dev/null || printf unknown)"
     kv uptime 'Uptime' "$(uptime -p 2>/dev/null || uptime 2>/dev/null || printf unavailable)"
+}
 
-    # ---- System resources -------------------------------------------------
+# System resources
+collect_resources() {
     section_table resources 'System resources' 'check=CHECK' 'status=STATUS' 'detail=DETAIL'
     if [[ -r /proc/meminfo ]]; then
         local mem_total mem_avail swap_total swap_used pct
@@ -529,8 +1258,10 @@ main() {
     else
         row 'Disk usage' 'INCONCLUSIVE' 'df command unavailable'
     fi
+}
 
-    # ---- Network interfaces -----------------------------------------------
+# Network interfaces
+collect_interfaces() {
     section_table network_interfaces 'Network interfaces' \
         'interface=INTERFACE' 'state=STATE' 'addresses=ADDRESSES'
     if have ip; then
@@ -545,32 +1276,10 @@ main() {
     else
         msg 'ip command unavailable'
     fi
+}
 
-    # ---- Listening sockets ------------------------------------------------
-    section_table listening_sockets 'Listening TCP/UDP sockets' \
-        'protocol=PROTOCOL' 'state=STATE' 'local_address=LOCAL ADDRESS' \
-        'peer_address=PEER ADDRESS' 'scope=SCOPE' 'process=PROCESS'
-    if have ss; then
-        # Older ss versions lack -H (no header); fall back to stripping it.
-        data=$(run_priv ss -H -lntup) || data=$(run_priv ss -lntup | awk 'NR > 1')
-        if [[ -n $data ]]; then
-            while IFS= read -r line; do
-                read -r proto sock_state _ _ local_addr peer_addr process_info <<<"$line"
-                scope=$(addr_scope "$local_addr")
-                row "$proto" "$sock_state" "$local_addr" "$peer_addr" "$scope" "${process_info:--}"
-                if [[ $scope == all ]]; then
-                    port="$proto/${local_addr##*:}"
-                    [[ " $exposed " == *" $port "* ]] || exposed="${exposed:+$exposed }$port"
-                fi
-            done <<<"$data"
-        else
-            msg 'No listening sockets found'
-        fi
-    else
-        msg 'ss command unavailable'
-    fi
-
-    # ---- systemd ------------------------------------------------------------
+# systemd
+collect_systemd() {
     section_table running_services 'Running systemd services' \
         'unit=UNIT' 'state=STATE' 'description=DESCRIPTION'
     if have systemctl; then
@@ -601,8 +1310,10 @@ main() {
     else
         msg 'systemctl command unavailable'
     fi
+}
 
-    # ---- Processes ----------------------------------------------------------
+# Processes
+collect_processes() {
     section_table processes 'Process sample (top 15 by CPU)' \
         'user=USER' 'pid=PID' 'command=COMMAND'
     if have ps; then
@@ -617,8 +1328,10 @@ main() {
     else
         msg 'ps command unavailable'
     fi
+}
 
-    # ---- Basic security checks ------------------------------------------------
+# Basic security checks
+collect_security() {
     section_table security_checks 'Basic security checks' \
         'check=CHECK' 'status=STATUS' 'detail=DETAIL'
 
@@ -803,8 +1516,10 @@ main() {
             row 'Services on all interfaces' 'INFO' 'none'
         fi
     fi
+}
 
-    # ---- Filesystem permission checks ----------------------------------------
+# Filesystem permission checks
+collect_filesystem() {
     section_table filesystem_checks 'Filesystem permission checks' \
         'check=CHECK' 'status=STATUS' 'detail=DETAIL'
     if have find; then
@@ -842,8 +1557,10 @@ main() {
     else
         msg 'find command unavailable'
     fi
+}
 
-    # ---- Package updates ------------------------------------------------------
+# Package updates
+collect_packages() {
     # Update simulations do not need root; results reflect the last metadata refresh.
     section_table package_updates 'Package updates' \
         'check=CHECK' 'status=STATUS' 'detail=DETAIL'
@@ -898,8 +1615,10 @@ main() {
     else
         row 'Package updates' 'INCONCLUSIVE' 'No supported package manager detected (apt, dnf, yum)'
     fi
+}
 
-    # ---- World-writable files -------------------------------------------------
+# World-writable files
+collect_temp_files() {
     section_table temp_files 'World-writable temporary files' \
         'check=CHECK' 'status=STATUS' 'detail=DETAIL'
     if have find; then
@@ -916,25 +1635,59 @@ main() {
     else
         row 'World-writable files' 'INCONCLUSIVE' 'find command unavailable'
     fi
+}
 
-    # ---- Summary ----------------------------------------------------------------
-    section_kv summary 'Scan summary'
-    if ((PRIV)); then
-        kv status 'Scan status' 'Completed'
-        kv coverage 'Coverage' 'Privileged checks attempted where implemented'
-    else
-        kv status 'Scan status' 'Completed with limited privileges'
-        kv coverage 'Coverage' 'Checks requiring elevated privileges may be incomplete'
-    fi
-    kv sudo 'Sudo status' "$(sudo_text "$SUDO_STATE")"
+main() {
+    local PRIV=0 data line count s n rc
+    local iface state addresses proto sock_state local_addr peer_addr process_info scope port exposed=''
+    local unit load active sub description proc_user proc_pid proc_command
+    local SERVICES='' PROCS='' ALL_PORTS='' SOCK_OK=0
+    local -a SOCK_LINES=()
 
-    if ((PRIV)); then
-        note 'Scan completed with sudo available.'
-    else
-        note 'NOTICE: Sudo was unavailable or skipped.'
-        note 'Accessible checks were completed; some results may be incomplete.'
+    if [[ $SUDO_STATE == nopasswd || $SUDO_STATE == password ]]; then
+        if run_priv true; then
+            PRIV=1
+        else
+            SUDO_STATE=failed
+            SUDO_PW=''
+        fi
     fi
-    note 'This basic scan is not a guarantee that the host is secure.'
+    meta sudo_state "$SUDO_STATE"
+    meta privileged "$PRIV"
+    meta scan_level "$LEVEL"
+    meta security "$SECURITY"
+
+    gather_sockets
+    gather_processes
+
+    # Quick scan: what this server is and what it serves (no sudo needed).
+    collect_host
+    collect_os
+    collect_roles
+    collect_services_offered
+    collect_network_summary
+    collect_users
+
+    if [[ $LEVEL == full ]]; then
+        collect_resources
+        collect_interfaces
+        collect_sockets_table
+        collect_systemd
+    fi
+    collect_processes
+    if [[ $LEVEL == full ]]; then
+        collect_security
+        collect_filesystem
+        collect_packages
+        collect_temp_files
+    fi
+
+    if ((SECURITY)); then
+        collect_exposed_services
+        collect_containers
+    fi
+
+    collect_summary
 }
 
 # The collector's own stdin is the script itself; keep commands away from it.
@@ -1005,9 +1758,13 @@ render_report() {
         for (j = 1; j <= ncol[s]; j++) line = line rep("-", w[j] + 2) "+"
         print line
     }
+    function scan_label() {
+        if (meta["scan_level"] == "") return ""
+        return " (" meta["scan_level"] " scan" ((meta["security"] == "1") ? " + security checks" : "") ")"
+    }
     function render_table(   s, j, r, cap, len, total, line, i, v, first) {
         first = 1
-        if (ENVIRON["RC_TITLE"] != "") { print "remotecheck report: " ENVIRON["RC_TITLE"]; first = 0 }
+        if (ENVIRON["RC_TITLE"] != "") { print "remotecheck report: " ENVIRON["RC_TITLE"] scan_label(); first = 0 }
         for (s = 1; s <= nsec; s++) {
             if (!first) print ""
             first = 0
@@ -1054,6 +1811,7 @@ render_report() {
         printf "  \"version\": %s,\n", jstr(ENVIRON["RC_VERSION"])
         printf "  \"target\": %s,\n", jstr(ENVIRON["RC_TITLE"])
         printf "  \"sudo\": {\"state\": %s, \"privileged\": %s},\n", jstr(meta["sudo_state"]), (meta["privileged"] == "1") ? "true" : "false"
+        printf "  \"scan\": {\"level\": %s, \"security\": %s},\n", jstr(meta["scan_level"]), (meta["security"] == "1") ? "true" : "false"
         printf "  \"findings\": {\"warning\": %d, \"review\": %d},\n", nwarn, nrev
         printf "  \"sections\": ["
         for (s = 1; s <= nsec; s++) {
@@ -1130,6 +1888,8 @@ scan_host() {
 
   if ((NO_SUDO)); then
     state=disabled
+  elif ((!WANT_SUDO)); then
+    state=unused
   else
     ssh "${opts[@]}" "$target" 'sudo -n true' </dev/null >/dev/null 2>&1
     sudo_rc=$?
@@ -1161,14 +1921,14 @@ scan_host() {
     esac
   fi
 
-  # $state is a fixed token, intentionally expanded locally. "env" keeps the
-  # command working with any remote login shell.
+  # $state, $LEVEL and $SECURITY are fixed tokens, intentionally expanded
+  # locally. "env" keeps the command working with any remote login shell.
   # shellcheck disable=SC2029
   {
     printf '%s\n' 'IFS= read -r SUDO_PW || SUDO_PW='
     printf '%s\n' "$pw"
     collector_script
-  } | ssh "${opts[@]}" "$target" "env REMOTE_SUDO_STATE=$state bash -s" >"$rec" 2>>"$err_dest"
+  } | ssh "${opts[@]}" "$target" "env REMOTE_SUDO_STATE=$state REMOTE_LEVEL=$LEVEL REMOTE_SECURITY=$SECURITY bash -s" >"$rec" 2>>"$err_dest"
   rc=$?
   pw=''
 
@@ -1279,6 +2039,10 @@ main() {
   normalize_targets
   ((${#TARGETS[@]} > 1)) && MULTI=1
   if ((NO_SUDO && ASK_SUDO_PASS)); then usage_error '--no-sudo and --ask-sudo-pass cannot be combined'; fi
+  if [[ $LEVEL == full ]] || ((SECURITY)); then WANT_SUDO=1; fi
+  if ((ASK_SUDO_PASS && !WANT_SUDO)); then
+    usage_error '--ask-sudo-pass needs --full or --security (quick scans never use sudo)'
+  fi
 
   command -v ssh >/dev/null 2>&1 || die 'ssh is required'
   command -v awk >/dev/null 2>&1 || die 'awk is required'
